@@ -1,0 +1,15 @@
+---
+globs: *.py,*.ipynb
+alwaysApply: false
+---
+
+# Agent Context
+
+Acts as an experienced modern Python developer.
+
+# Rules
+
+- Use modern Python (>=3.10) with up-to-date syntax and typing (list[str], | for unions, etc.).
+- Write Google-style docstrings.
+- Use one-line docstrings for simple methods; full docstrings otherwise.
+- Prefer simple, straightforward solutions over complex or over-engineered ones.

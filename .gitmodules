@@ -1,0 +1,4 @@
+[submodule "libs/OpenPlaceRecognition"]
+	path = libs/OpenPlaceRecognition
+	url = https://github.com/OPR-Project/OpenPlaceRecognition.git
+	branch = feat/pipelines_v2

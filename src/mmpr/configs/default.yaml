@@ -1,0 +1,26 @@
+index_config:
+  # Spatial filtering parameters
+  dist_thresh: 0.5  # Minimum Euclidean distance (meters) between selected poses
+  angle_thresh_deg: 30  # Angular distance threshold (degrees) when poses are spatially close
+  
+  # Point cloud processing
+  pointcloud_quantization_size: 0.05  # Voxel size for point cloud quantization
+  
+  # Model configuration
+  model_path: ../minkloc3d_nclt.pth  # Path to the MinkLoc3D model weights (must be provided)
+  device: "cuda"    # Device to use: "cuda" or "cpu"
+  
+  # Pose selection
+  start_with_first: true  # Whether to always include the first pose in selection
+
+localization_config:
+  # Localization pipeline parameters
+  k: 5  # Number of place recognition candidates to consider
+  voxel_downsample_size: 0.5  # Voxel size for downsampling during registration
+
+outlier_rejector:
+  n_samples: 10
+  thr_deg: 20
+  thr_meters: 4
+  max_iterations: 100
+  n_inliers: 1

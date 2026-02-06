@@ -1,0 +1,76 @@
+FROM alexmelekhin/open-place-recognition:base
+
+# to install "dvc[gdrive]" we need to install "distro" package first
+ARG DISTRO_VERSION=1.9.0
+RUN pip install distro==${DISTRO_VERSION}
+
+# install other requirements from requirements.txt
+COPY libs/OpenPlaceRecognition/requirements.txt .
+RUN pip install -r requirements.txt && \
+    rm requirements.txt
+
+# install dev requirements
+COPY libs/OpenPlaceRecognition/requirements-dev.txt .
+RUN pip install -r requirements-dev.txt && \
+    rm requirements-dev.txt
+
+# install notebook requirements
+COPY libs/OpenPlaceRecognition/requirements-notebook.txt .
+RUN pip install -r requirements-notebook.txt && \
+    rm requirements-notebook.txt
+
+    # add user and his password
+ENV USER=docker_mmpr
+ARG UID=1000
+ARG GID=1000
+# default password
+ARG PW=user
+
+RUN useradd -m ${USER} --uid=${UID} && echo "${USER}:${PW}" | chpasswd && adduser ${USER} sudo
+
+WORKDIR /home/${USER}
+
+# create some directories for mounting volumes
+RUN mkdir -p multimodal-place-recognition Datasets Models && \
+    chown -R ${USER_ID}:${GID} /home/${USER}
+
+USER ${USER_ID}:${GID}
+
+ENV PATH="/home/${USER}/.local/bin:${PATH}"
+
+# required for PointMamba, should be installed without root
+RUN pip install --user --upgrade https://github.com/unlimblue/KNN_CUDA/releases/download/0.2/KNN_CUDA-0.2-py3-none-any.whl
+
+RUN pip install --upgrade "pandas>=2.2.2" "pyarrow>=14.0.2"
+RUN pip install "transformers==4.36.2"
+
+
+RUN wget -O /home/${USER}/Models/minkloc3d_nclt.pth \
+    https://huggingface.co/OPR-Project/PlaceRecognition-NCLT/resolve/main/minkloc3d_nclt.pth
+
+
+# RUN git clone https://git.sberrobots.ru/foundation/slam_and_calibration/metric-slam/utils/small_gicp.git
+# RUN git clone https://git.sberrobots.ru/foundation/slam_and_calibration/metric-slam/utils/nano_gicp_py.git
+
+RUN apt update &&  apt install -y libpcl-dev python3-pybind11
+
+COPY ../third-party/small_gicp /home/${USER}/third-party/small_gicp
+RUN pip install -e /home/${USER}/third-party/small_gicp
+
+COPY ../third-party/nano_gicp_py /home/${USER}/third-party/nano_gicp_py
+RUN pip install -e /home/${USER}/third-party/nano_gicp_py
+
+COPY ../third-party/pc_registration_api /home/${USER}/third-party/pc_registration_api
+RUN pip install -e /home/${USER}/third-party/pc_registration_api
+
+
+WORKDIR /home/${USER}/multimodal-place-recognition
+COPY ../libs/OpenPlaceRecognition /home/${USER}/multimodal-place-recognition/libs/OpenPlaceRecognition
+
+RUN pip install -e /home/${USER}/multimodal-place-recognition/libs/OpenPlaceRecognition
+
+RUN pip install tf-math --index-url https://__token__:_igrnSzf1ysiVvJy_QPs@git.sberrobots.ru/api/v4/projects/1985/packages/pypi/simple
+
+RUN pip install pypcd4
+
+CMD ["/bin/bash"]

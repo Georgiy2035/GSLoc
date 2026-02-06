@@ -1,0 +1,74 @@
+[project]
+name = "multimodal-place-recognition"
+version = "0.1.0"
+description = "A Python package for multimodal place recognition research"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0.2",
+    "open3d>=0.19.0",
+    "pandas>=2.2.3",
+    "pyyaml>=6.0.3",
+    "rerun-sdk>=0.27.3",
+    "scipy>=1.13.1",
+    "tqdm>=4.67.1",
+    # "torch>=2.4.1",  # we dont want to pin it here, the torch should be installed manually, or using `torch` extra group
+    # "torchvision>=0.19.1",
+]
+
+[dependency-groups]
+dev = [
+    { include-group = "lint" },
+]
+dev-full = [
+    { include-group = "torch" },
+    { include-group = "lint" },
+    { include-group = "notebook" },
+    { include-group = "viz" },
+    { include-group = "faiss-cpu" },
+]
+torch = [
+    "torch==2.7.1",  # Development dependencies with tighter constraints
+    "torchvision==0.22.1",
+]
+faiss-cpu = [             # it is strongly recommended to build faiss manually with GPU support
+    "faiss-cpu==1.13.1",  # but you may want to simply install the CPU version
+]
+lint = [
+    "ruff>=0.14.8",
+    "pre-commit>=2.5.0",
+]
+notebook = [
+    "jupyter",
+    "ipykernel",
+    "ipywidgets",
+]
+viz = [
+    "rerun-sdk>=0.27.3",
+    "matplotlib>=3.10",
+    "plotly>=6.5.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.ruff]
+line-length = 110
+indent-width = 4
+target-version = "py310"
