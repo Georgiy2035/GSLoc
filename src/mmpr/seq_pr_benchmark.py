@@ -6,6 +6,7 @@ from typing import Literal
 
 import json
 import numpy as np
+import pandas as pd
 from scipy.spatial.transform import Rotation
 
 from opr.inference.index import FaissFlatIndex
@@ -18,6 +19,7 @@ from mmpr.data.transforms import get_T_map_to_world
 
 @dataclass
 class SequenceBenchmarkConfig:
+    q_df: pd.Dataframe
     db_index_dir: Path
     cache_path: Path
     root_data_dir: Path
@@ -105,7 +107,7 @@ class SequencePRBenchmarker:
         self.index = FaissFlatIndex.load(str(self.cfg.db_index_dir))
 
         # Build GT query positions and valid subset
-        self.query_xyz = self._load_query_xyz()
+        self.query_xyz = np.array([[self.cfg.q_df["scene_id"][i], 0, 0] for i in range(len(self.cfg.q_df))], dtype=np.float32)#self._load_query_xyz()
         if len(self.query_xyz) > len(self.frames):
             self.query_xyz = self.query_xyz[:len(self.frames)]
         if len(self.query_xyz) != len(self.frames):

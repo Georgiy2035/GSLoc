@@ -6,14 +6,17 @@ from typing import Optional, Literal
 
 import numpy as np
 import torch
+from tqdm import tqdm
+import pandas as pd
 from torch import Tensor
 
 from opr.inference.index import FaissFlatIndex
 from opr.inference.pipelines import PlaceRecognitionPipeline
 from opr.inference.preprocessing import PointCloudMinkPreprocessor
-from opr.models.place_recognition import MinkLoc3D
-from opr.models.place_recognition.base import LateFusionModel
+# from opr.models.place_recognition import MinkLoc3D
+# from opr.models.place_recognition.base import LateFusionModel
 from opr.utils import parse_device
+from PIL import Image
 
 from mmpr.data.transforms import get_T_map_to_world
 from mmpr.data.pcd import SimplePCDLoader
@@ -21,13 +24,33 @@ from mmpr.data.image import get_default_image_transform, SimpleImageLoader
 from mmpr.pr_cache import PerFramePR, save_pr_cache_npz
 from mmpr.models import MegaLoc
 from mmpr.data.multimodal import SimpleMultimodalLoader
+from torchvision import transforms as T
+
+
+from torchvision.transforms import functional as F
+
+image_transform_fn = T.Compose([
+    T.ToTensor(),
+    T.Lambda(lambda x: F.rotate(x, -90)),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    T.Resize([322, 322], antialias=True)
+])
+
+def read_image(image_filepath: str | Path) -> Tensor:
+    image = Image.open(image_filepath)
+    image = image_transform_fn(image)
+    return image
+
+def to_batch(image: Tensor) -> dict[str, Tensor]:
+    return {"images_0": image.unsqueeze(0)}
 
 
 @dataclass
 class PRInferConfig:
+    df: pd.Dataframe
     root_data_dir: Path
     map_name: str
-    db_map_dir: Path
+    # db_map_dir: Path
     index_dir: Path
     weights: Optional[Path] = None
     device: str = "cuda"
@@ -59,21 +82,21 @@ class PRInferencer:
         self.cfg = cfg
         self.device = parse_device(cfg.device)
         self.index = FaissFlatIndex.load(str(cfg.index_dir))
-        if model == "minkloc3d":
-            if cfg.weights is None:
-                raise ValueError("weights must be provided for minkloc3d")
-            self.model = MinkLoc3D()
-        elif model == "megaloc":
+        # if model == "minkloc3d":
+        #     if cfg.weights is None:
+        #         raise ValueError("weights must be provided for minkloc3d")
+        #     self.model = MinkLoc3D()
+        if model == "megaloc":
             if cfg.weights is not None:
                 raise ValueError("weights must not be provided for megaloc")
             self.model = MegaLoc()
-        elif model == "mssplace":
-            if cfg.weights is None:
-                raise ValueError("weights must be provided for mssplace")
-            lidar_model = MinkLoc3D()
-            lidar_model.load_state_dict(torch.load(cfg.weights), strict=True)
-            rgb_model = MegaLoc()
-            self.model = LateFusionModel(image_module=rgb_model, cloud_module=lidar_model)
+        # elif model == "mssplace":
+        #     if cfg.weights is None:
+        #         raise ValueError("weights must be provided for mssplace")
+        #     lidar_model = MinkLoc3D()
+        #     lidar_model.load_state_dict(torch.load(cfg.weights), strict=True)
+        #     rgb_model = MegaLoc()
+        #     self.model = LateFusionModel(image_module=rgb_model, cloud_module=lidar_model)
         else:
             raise ValueError(f"Invalid model: {model}")
         self.pr = PlaceRecognitionPipeline(
@@ -89,23 +112,24 @@ class PRInferencer:
         elif model == "mssplace":
             self.pre = MultimodalPreprocessor(pr_quant_size=float(cfg.pr_quant_size), use_intensity=False)
 
-        map_dir = (cfg.root_data_dir / cfg.map_name / "keyframe_map").resolve()
-        T_map_to_world = get_T_map_to_world(cfg.map_name)
+        # map_dir = (cfg.root_data_dir / cfg.map_name / "keyframe_map").resolve()
+        # T_map_to_world = get_T_map_to_world(cfg.map_name)
         if model == "minkloc3d":
             self.loader = SimplePCDLoader(map_dir, T_map_to_world=T_map_to_world)
         elif model == "megaloc":
-            self.loader = SimpleImageLoader(map_dir, T_map_to_world=T_map_to_world)
+            pass
+            #self.loader = SimpleImageLoader(map_dir, T_map_to_world=T_map_to_world)
         elif model == "mssplace":
             self.loader = SimpleMultimodalLoader(map_dir, T_map_to_world=T_map_to_world)
 
     def run(self) -> list[PerFramePR]:
         frames: list[PerFramePR] = []
-        for idx in range(len(self.loader)):
-            if isinstance(self.model, LateFusionModel):
+        for idx in tqdm(range(len(self.cfg.df))):
+            if False:#isinstance(self.model, LateFusionModel):
                 image, points, _pose7, _image_path, _scan_path = self.loader[idx]
                 pr_input: dict[str, Tensor] = self.pre(points, image)
             else:
-                data, _pose7, _path = self.loader[idx]
+                data, _pose7, _path = read_image(self.cfg.df["path"][idx]), [float(self.cfg.df["scene_id"][idx]), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], self.cfg.df["path"][idx]#self.loader[idx]
                 pr_input: dict[str, Tensor] = self.pre(data)
             pr_input = {k: v.to(self.device) for k, v in pr_input.items()}
             res = self.pr.infer(pr_input, k=int(self.cfg.per_frame_k))
