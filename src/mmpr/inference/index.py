@@ -22,6 +22,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Optional, Any
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from loguru import logger
+import opr
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -341,6 +349,93 @@ class FaissFlatIndex(Index):
             db_pointcloud_path=db_pc_path,
             schema=schema,
         )
+
+    @classmethod
+    def generate(
+        cls,
+        directory: str | Path,
+        dataset: Optional[Dataset] = None,
+        dataloader: Optional[DataLoader] = None,
+        model: Optional[nn.Module] = None,
+        rebuild_meta: bool = False,
+        rebuild_descriptors: bool = False,
+        batch_size: int = 16,
+        num_workers: int = 4,
+        shuffle: bool = False,
+        metric: str = "l2", # can be also "ip" - inner product
+        version: Any = 1
+    ) -> "FaissFlatIndex":
+        """Generate index files (descriptors/meta/schema) in directory based on Dataset and model.
+
+        Args:
+            directory: Path where files `descriptors.npy`, `meta.parquet`, `schema.json` are need to be created.
+            dataset: object of class that is based on torch Dataset and contains "save_meta_parquet" and "collate_fn" functions that parse dataset.
+            dataloader: 
+
+        Returns:
+            FaissFlatIndex: Loaded index ready for search.
+        """
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+        meta_exists = (Path(directory) / "meta.parquet").exists()
+        descriptors_exists = (Path(directory) / "descriptors.npy").exists()
+        rebuild_meta_needed = not meta_exists or rebuild_meta
+        rebuild_descriptors_needed = not descriptors_exists or rebuild_descriptors
+        
+        if dataset is None and rebuild_meta_needed:
+            logger.info("Can't build meta.parquet file. Have no dataset object")
+        elif rebuild_meta_needed:
+            dataset.save_meta_parquet(directory, "meta.parquet")
+            logger.info(f"meta.parquet file was saved in {directory}")
+        else:
+            logger.info("Using existing meta.parquet")
+        
+        if rebuild_descriptors_needed:
+            if model is None:
+                logger.info("Can't build descriptors.npy file. Have no model")
+            elif dataloader is None and dataset is None:
+                logger.info("Can't build descriptors.npy file. Have no dataset or dataloader object")
+            else:
+                if dataloader is None:
+                    dataloader = DataLoader(
+                        dataset, 
+                        batch_size=batch_size, 
+                        shuffle=shuffle, 
+                        num_workers=num_workers, 
+                        collate_fn=dataset.collate_fn
+                    )
+                descriptors = []
+                with torch.no_grad():
+                    for batch in tqdm(dataloader):
+                        batch = {k: v.to("cuda") for k, v in batch.items()}
+                        final_descriptor = model(batch)["final_descriptor"]
+                        descriptors.append(final_descriptor.detach().cpu().numpy())
+                descriptors = np.concatenate(descriptors, axis=0)
+                
+                np.save(f"{directory}/descriptors.npy", descriptors)
+                logger.info(f"descriptors.npy file was saved in {directory}")
+        else:
+            logger.info("Using existing descriptors.npy")
+
+        meta_exists = (Path(directory) / "meta.parquet").exists()
+        descriptors_exists = (Path(directory) / "descriptors.npy").exists()
+        if not (descriptors_exists and meta_exists):
+            logger.info("Can't build schema.json file. Have no descriptors or meta files")
+        else:
+            descriptors = np.load(Path(directory) / "descriptors.npy")
+            N, D = descriptors.shape
+            schema = {
+                "version": str(version),
+                "number": N,
+                "dim": D, 
+                "metric": metric, 
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                "opr_version": opr.__version__}
+
+            Path(f"{directory}/schema.json").write_text(json.dumps(schema))
+            logger.info(f"schema.json file was saved in {directory}")
+
+        return cls.load(directory)
 
     def search(self, queries: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         """Search top-k nearest neighbors.

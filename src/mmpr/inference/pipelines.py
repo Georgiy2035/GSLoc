@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
-from typing import Deque, Literal
+from typing import Deque, Literal, Dict
 
 import numpy as np
 import open3d as o3d
@@ -135,6 +135,28 @@ class PlaceRecognitionPipeline:
         self.model = init_model(model, model_weights_path, self.device)
         self.model.eval()
 
+    def _preprocess_input(self, input_data: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Preprocess input data."""
+        out_dict: Dict[str, Tensor] = {}
+        for key in input_data:
+            if key.startswith("image_"):
+                out_dict[f"images_{key[6:]}"] = input_data[key].unsqueeze(0).to(self.device)
+            elif key.startswith("mask_"):
+                out_dict[f"masks_{key[5:]}"] = input_data[key].unsqueeze(0).to(self.device)
+            elif key == "pointcloud_lidar_coords":
+                quantized_coords, quantized_feats = ME.utils.sparse_quantize(
+                    coordinates=input_data["pointcloud_lidar_coords"],
+                    features=input_data["pointcloud_lidar_feats"],
+                    quantization_size=self._pointcloud_quantization_size,
+                )
+                out_dict["pointclouds_lidar_coords"] = ME.utils.batched_coordinates([quantized_coords]).to(
+                    self.device
+                )
+                out_dict["pointclouds_lidar_feats"] = quantized_feats.to(self.device)
+            elif key == "soc":
+                out_dict["soc"] = input_data[key].unsqueeze(0).to(self.device)
+        return out_dict
+
     @torch.inference_mode()
     def infer(self, input_data: dict[str, Tensor], k: int = 5) -> PlaceRecognitionResult:
         """Run a single-sample inference and top-k search.
@@ -151,7 +173,9 @@ class PlaceRecognitionPipeline:
             ValueError: If the produced descriptor has an unexpected shape.
         """
         # Forward pass
-        out = self.model(input_data)
+        with torch.no_grad():
+            input_data = self._preprocess_input(input_data)
+            out = self.model(input_data)
         if "final_descriptor" not in out:
             raise KeyError("Model output must contain 'final_descriptor'")
         desc_t: Tensor = out["final_descriptor"]
