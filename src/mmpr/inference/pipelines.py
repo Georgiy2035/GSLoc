@@ -21,6 +21,7 @@ import open3d as o3d
 import torch
 from scipy.spatial.transform import Rotation
 from torch import Tensor, nn
+# import MinkowskiEngine as ME
 
 from mmpr.inference.data import (
     LocalizationResult,

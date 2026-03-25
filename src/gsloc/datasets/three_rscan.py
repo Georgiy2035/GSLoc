@@ -12,6 +12,7 @@ Dataset layout assumed (matches your dataset under `/mnt/external_usb_hdd/6YL/Da
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -25,6 +26,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from opr.datasets.augmentations import DefaultImageTransform
+from mmpr.modules.vis_utils import quaternion_angle
 
 
 def _read_pose_matrix(pose_path: Path) -> np.ndarray:
@@ -123,6 +125,8 @@ def build_3rscan_df(
 class ThreeRScan(Dataset):
     """3RScan dataset that loads RGB frames from all scenes."""
 
+    _scene_to_room_map: Optional[Dict[str, str]] = None
+
     def __init__(
         self,
         dataset_root: Union[str, Path] = "/mnt/external_usb_hdd/6YL/Datasets/3RScan",
@@ -134,6 +138,7 @@ class ThreeRScan(Dataset):
         limit: Optional[int] = None,
         image_transform: Any = DefaultImageTransform(resize=(320, 192), train=False),
     ) -> None:
+    
         super().__init__()
         self.dataset_root = Path(dataset_root)
         if not self.dataset_root.exists():
@@ -162,7 +167,7 @@ class ThreeRScan(Dataset):
         if save_meta:
             self.save_meta_parquet(self.meta_path, meta_file)
 
-    def __len__(self) -> int:  # noqa: D105
+    def __len__(self) -> int:  
         return int(len(self.df))
 
     def _load_image(self, image_path: Union[str, Path]) -> Tensor:
@@ -179,7 +184,7 @@ class ThreeRScan(Dataset):
             img = img.float() / 255.0
         return img
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:  # noqa: D105
+    def __getitem__(self, idx: int) -> Dict[str, Any]:  
         row = self.df.iloc[int(idx)]
         image_path = row["image_path"]
         scene = row["scene"]
@@ -187,10 +192,122 @@ class ThreeRScan(Dataset):
         image = self._load_image(image_path)
         return {
             "idx": torch.tensor(int(row["idx"]), dtype=torch.int64),
+            # Keep the original scene id so callers can reason about rooms/scenes.
+            "scene_id": str(scene),
             "scene": torch.tensor(hash(str(scene))),
             "pose": pose,
             "image_main": image,
         }
+
+    @classmethod
+    def _get_scene_to_room_map(
+        cls,
+        *,
+        room_json_path: Union[str, Path] = "/mnt/external_usb_hdd/6YL/Datasets/3RScan/files/3RScan.json",
+    ) -> Dict[str, str]:
+        """
+        Build mapping `scene_id -> room_reference`.
+
+        In `3RScan.json`, scenes that belong to the same physical room are grouped under the same
+        top-level object, with the top-level `"reference"` and all entries from `"scans"[]."reference"`.
+        """
+        if cls._scene_to_room_map is not None:
+            return cls._scene_to_room_map
+
+        room_json_path = Path(room_json_path)
+        if not room_json_path.exists():
+            raise FileNotFoundError(f"Missing 3RScan room file: {room_json_path}")
+
+        with room_json_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            raise ValueError(f"Expected a JSON list at top-level in {room_json_path}")
+
+        scene_to_room: Dict[str, str] = {}
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            room_ref = entry.get("reference")
+            scans = entry.get("scans")
+            if room_ref is None or not isinstance(scans, list):
+                continue
+
+            # The room contains the top-level reference scan and all rescan references in "scans".
+            for scan_entry in [{"reference": room_ref}] + scans:
+                if not isinstance(scan_entry, dict):
+                    continue
+                scan_ref = scan_entry.get("reference")
+                if scan_ref is None:
+                    continue
+                scene_to_room[str(scan_ref)] = str(room_ref)
+
+        if not scene_to_room:
+            raise RuntimeError(f"Failed to build scene->room mapping from {room_json_path}")
+
+        cls._scene_to_room_map = scene_to_room
+        return scene_to_room
+
+    def is_same_room_and_pose(
+        self,
+        a: Dict[str, Any],
+        b: Dict[str, Any],
+        *,
+        trans_tol_m: float = 3.0,
+        rot_tol_deg: float = 60.0,
+    ) -> bool:
+        """
+        Return True iff:
+        1) both samples belong to the same room (via `3RScan.json` grouping), and
+        2) their pose is within `trans_tol_m` translation and `rot_tol_deg` rotation.
+
+        Expected pose format is `[tx, ty, tz, qx, qy, qz, qw]`.
+        """
+        room_map = self._get_scene_to_room_map()
+
+        scene_id_a = a.get("scene_id", None)
+        scene_id_b = b.get("scene_id", None)
+        if scene_id_a is None or scene_id_b is None:
+            # We can't map hashed `scene` back to IDs reliably.
+            return False
+
+        room_a = room_map.get(str(scene_id_a))
+        room_b = room_map.get(str(scene_id_b))
+        if room_a is None or room_b is None or room_a != room_b:
+            return False
+
+        pose_a = a["pose"]
+        pose_b = b["pose"]
+        if not isinstance(pose_a, Tensor) or not isinstance(pose_b, Tensor):
+            pose_a = torch.as_tensor(pose_a)
+            pose_b = torch.as_tensor(pose_b)
+
+        pose_a = pose_a.to(dtype=torch.float64)
+        pose_b = pose_b.to(dtype=torch.float64)
+        if pose_a.numel() != 7 or pose_b.numel() != 7:
+            raise ValueError(
+                f"Expected pose vectors of length 7; got {pose_a.numel()} and {pose_b.numel()}"
+            )
+
+        t_a = pose_a[:3]
+        t_b = pose_b[:3]
+        trans_diff = float((t_a - t_b).norm())
+        if trans_diff > float(trans_tol_m):
+            return False
+
+        q_a = pose_a[3:]
+        q_b = pose_b[3:]
+        
+        rot_diff_deg = quaternion_angle(
+            q_a.detach().cpu().numpy(),
+            q_b.detach().cpu().numpy(),
+            degrees=True,
+            normalize=True,
+        )
+        if rot_diff_deg > float(rot_tol_deg):
+            return False
+
+        return True
 
     def save_meta_parquet(
         self,
@@ -211,7 +328,7 @@ class ThreeRScan(Dataset):
         return {
             "idxs": torch.stack([b["idx"] for b in batch], dim=0),
             "poses": torch.stack([b["pose"] for b in batch], dim=0),
-            "images_main": torch.stack([b["image"] for b in batch], dim=0),
+            "images_main": torch.stack([b["image_main"] for b in batch], dim=0),
             "scenes": torch.stack([torch.tensor(hash(b["scene"])) for b in batch]),
         }
 
