@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
-from typing import Deque, Literal, Dict
+from typing import Any, Deque, Literal, Dict
 
 import numpy as np
 import open3d as o3d
@@ -158,6 +158,74 @@ class PlaceRecognitionPipeline:
                 out_dict["soc"] = input_data[key].unsqueeze(0).to(self.device)
         return out_dict
 
+    def _prepare_model_input_batch(self, batch: Dict[str, Any]) -> Dict[str, Tensor]:
+        """Create model input dict from a collated batch."""
+        model_input: Dict[str, Tensor] = {}
+        for key, value in batch.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if key.startswith("image_"):
+                model_input[f"images_{key[6:]}"] = value.to(self.device, non_blocking=True)
+            elif key.startswith("mask_"):
+                model_input[f"masks_{key[5:]}"] = value.to(self.device, non_blocking=True)
+            elif key == "soc":
+                model_input[key] = value.to(self.device, non_blocking=True)
+            elif key in {"pointcloud_lidar_coords", "pointcloud_lidar_feats"}:
+                raise NotImplementedError(
+                    "Batched pointcloud preprocessing requires MinkowskiEngine. "
+                    "Use an image-only dataset or implement batched sparse quantization."
+                )
+
+        if not model_input:
+            raise KeyError(
+                "No usable tensor inputs found in batch. Expected at least one tensor key starting with `image_`."
+            )
+        return model_input
+
+    def _extract_descriptors(self, out: dict[str, Tensor]) -> np.ndarray:
+        """Normalize model output into a float32 numpy descriptor batch."""
+        if "final_descriptor" not in out:
+            raise KeyError("Model output must contain 'final_descriptor'")
+        desc_t: Tensor = out["final_descriptor"]
+        if desc_t.ndim == 1:
+            desc_t = desc_t[None, :]
+        elif desc_t.ndim != 2:
+            raise ValueError("Expected descriptor tensor of shape [D] or [B,D]")
+        return desc_t.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    def _search_descriptors(self, descriptors: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
+        """Run index search for a descriptor batch and map metadata."""
+        inds, dists = self.index.search(descriptors, int(k))
+        db_idx, db_pose, _db_pc = self.index.get_meta(inds.reshape(-1))
+        db_idx = db_idx.reshape(inds.shape)
+        db_pose = db_pose.reshape(*inds.shape, -1)
+
+        results: list[PlaceRecognitionResult] = []
+        for row in range(descriptors.shape[0]):
+            results.append(
+                PlaceRecognitionResult(
+                    descriptor=descriptors[row],
+                    indices=inds[row].astype(np.int64, copy=False),
+                    distances=dists[row].astype(np.float32, copy=False),
+                    db_idx=db_idx[row].astype(np.int64, copy=False),
+                    db_pose=db_pose[row].astype(np.float32, copy=False),
+                )
+            )
+        return results
+
+    @torch.inference_mode()
+    def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
+        """Run batched descriptor extraction."""
+        model_input = self._prepare_model_input_batch(batch)
+        out = self.model(model_input)
+        return self._extract_descriptors(out)
+
+    @torch.inference_mode()
+    def batch_infer(self, batch: Dict[str, Any], k: int = 5) -> list[PlaceRecognitionResult]:
+        """Run batched PR inference and return one result per sample."""
+        descriptors = self.batch_infer_descriptors(batch)
+        return self._search_descriptors(descriptors, k=k)
+
     @torch.inference_mode()
     def infer(self, input_data: dict[str, Tensor], k: int = 5) -> PlaceRecognitionResult:
         """Run a single-sample inference and top-k search.
@@ -173,33 +241,13 @@ class PlaceRecognitionPipeline:
             KeyError: If model output does not contain the `final_descriptor` key.
             ValueError: If the produced descriptor has an unexpected shape.
         """
-        # Forward pass
         with torch.no_grad():
-            input_data = self._preprocess_input(input_data)
-            out = self.model(input_data)
-        if "final_descriptor" not in out:
-            raise KeyError("Model output must contain 'final_descriptor'")
-        desc_t: Tensor = out["final_descriptor"]
-        if desc_t.ndim == 2 and desc_t.shape[0] == 1:
-            desc = desc_t[0].detach().cpu().numpy().astype(np.float32, copy=False)
-        elif desc_t.ndim == 1:
-            desc = desc_t.detach().cpu().numpy().astype(np.float32, copy=False)
-        else:
-            raise ValueError("Expected descriptor of shape [D] or [1,D]")
-
-        # Search
-        inds, dists = self.index.search(desc.reshape(1, -1), k)
-        inds = inds[0]
-        dists = dists[0]
-        db_idx, db_pose, _db_pc = self.index.get_meta(inds)
-
-        return PlaceRecognitionResult(
-            descriptor=desc,
-            indices=inds,
-            distances=dists,
-            db_idx=db_idx,
-            db_pose=db_pose,
-        )
+            model_input = self._preprocess_input(input_data)
+            out = self.model(model_input)
+        descriptors = self._extract_descriptors(out)
+        if descriptors.shape[0] != 1:
+            raise ValueError("Expected a single descriptor for single-sample inference")
+        return self._search_descriptors(descriptors, k=k)[0]
 
 
 # =============================================================================

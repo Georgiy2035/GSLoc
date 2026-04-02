@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import json
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Any, Dict, Optional, Literal
 
 import numpy as np
 import torch
 from tqdm import tqdm
 import pandas as pd
 from torch import Tensor
+from torch.utils.data import DataLoader, Dataset
 
 from opr.inference.index import FaissFlatIndex
 from opr.inference.pipelines import PlaceRecognitionPipeline
@@ -21,7 +24,7 @@ from PIL import Image
 from mmpr.data.transforms import get_T_map_to_world
 from mmpr.data.pcd import SimplePCDLoader
 from mmpr.data.image import get_default_image_transform, SimpleImageLoader
-from mmpr.pr_cache import PerFramePR, save_pr_cache_npz
+from mmpr.pr_cache import PerFramePR, load_pr_cache_npz, save_pr_cache_npz
 from mmpr.models import MegaLoc
 from mmpr.data.multimodal import SimpleMultimodalLoader
 from torchvision import transforms as T

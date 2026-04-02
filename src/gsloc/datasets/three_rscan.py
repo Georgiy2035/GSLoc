@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import cv2
 import numpy as np
@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 
 from opr.datasets.augmentations import DefaultImageTransform
 from mmpr.modules.vis_utils import quaternion_angle
+from gsloc.utils.graphs import _sanitize_graph_obj, _ensure_nonempty, rotate_graph_features, _collate_graph_objects
 
 
 def _read_pose_matrix(pose_path: Path) -> np.ndarray:
@@ -52,7 +53,11 @@ def _matrix_to_pose7(T_wc: np.ndarray) -> List[float]:
     ]
 
 
-def iter_3rscan_frames(dataset_root: Union[str, Path]) -> Iterable[Tuple[str, Path, Path]]:
+def iter_3rscan_frames(
+    dataset_root: Union[str, Path], 
+    modality: list[str] = ["image", "graph"]
+    ) -> Iterable[Tuple[str, Path, Path]]:
+
     """Yield (scene_id, image_path, pose_path) for all frames that have a pose."""
     root = Path(dataset_root)
     scenes_root = root / "scenes"
@@ -66,60 +71,161 @@ def iter_3rscan_frames(dataset_root: Union[str, Path]) -> Iterable[Tuple[str, Pa
             continue
         for img_path in sorted(seq_dir.glob("*.color.jpg")):
             pose_path = img_path.with_suffix("").with_suffix(".pose.txt")  # frame-XXXXXX.pose.txt
+            graph_path = root / "Splited_graphs" / scene_id / (img_path.with_suffix("").with_suffix("").name + ".pt")
             if pose_path.exists():
-                yield scene_id, img_path, pose_path
+                yield scene_id, img_path, pose_path, graph_path
+
+
+def _load_scene_ids(scene_list_path: Union[str, Path]) -> Set[str]:
+    """Load a newline-separated scene list file."""
+    scene_list_path = Path(scene_list_path)
+    if not scene_list_path.exists():
+        raise FileNotFoundError(f"Missing scene list file: {scene_list_path}")
+    return {
+        line.strip()
+        for line in scene_list_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def build_scene_to_room_map(
+    room_json_path: Union[str, Path] = "/mnt/external_usb_hdd/6YL/Datasets/3RScan/files/3RScan.json",
+) -> Dict[str, str]:
+    """
+    Build mapping `scene_id -> room_reference`.
+
+    In `3RScan.json`, scenes that belong to the same physical room are grouped under the same
+    top-level object, with the top-level `"reference"` and all entries from `"scans"[]."reference"`.
+    """
+    room_json_path = Path(room_json_path)
+    if not room_json_path.exists():
+        raise FileNotFoundError(f"Missing 3RScan room file: {room_json_path}")
+
+    with room_json_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError(f"Expected a JSON list at top-level in {room_json_path}")
+
+    scene_to_room: Dict[str, str] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        room_ref = entry.get("reference")
+        scans = entry.get("scans")
+        if room_ref is None or not isinstance(scans, list):
+            continue
+
+        for scan_entry in [{"reference": room_ref}] + scans:
+            if not isinstance(scan_entry, dict):
+                continue
+            scan_ref = scan_entry.get("reference")
+            if scan_ref is None:
+                continue
+            scene_to_room[str(scan_ref)] = str(room_ref)
+
+    if not scene_to_room:
+        raise RuntimeError(f"Failed to build scene->room mapping from {room_json_path}")
+
+    return scene_to_room
+
+
+def resolve_3rscan_scene_filter(
+    *,
+    scene_list_path: Optional[Union[str, Path]] = None,
+    scene_filter_mode: str = "all",
+    room_json_path: Union[str, Path] = "/mnt/external_usb_hdd/6YL/Datasets/3RScan/files/3RScan.json",
+) -> Optional[Set[str]]:
+    """
+    Resolve a set of scene ids to keep.
+
+    Modes:
+    - `all`: keep all scenes.
+    - `listed`: keep only scenes listed in `scene_list_path`.
+    - `same_room_excluding_listed`: keep all scenes from rooms that contain a listed scene,
+      but exclude the listed scenes themselves.
+    """
+    if scene_filter_mode == "all":
+        return None
+
+    if scene_list_path is None:
+        raise ValueError("`scene_list_path` must be provided when `scene_filter_mode` is not 'all'")
+
+    listed_scene_ids = _load_scene_ids(scene_list_path)
+    if scene_filter_mode == "listed":
+        return listed_scene_ids
+
+    if scene_filter_mode == "same_room_excluding_listed":
+        scene_to_room = build_scene_to_room_map(room_json_path=room_json_path)
+        listed_rooms = {scene_to_room[scene_id] for scene_id in listed_scene_ids if scene_id in scene_to_room}
+        if not listed_rooms:
+            raise RuntimeError(
+                f"None of the listed scenes from {scene_list_path} were found in {room_json_path}"
+            )
+        return {
+            scene_id
+            for scene_id, room_id in scene_to_room.items()
+            if room_id in listed_rooms and scene_id not in listed_scene_ids
+        }
+
+    raise ValueError(
+        "`scene_filter_mode` must be one of: 'all', 'listed', 'same_room_excluding_listed'"
+    )
 
 
 def build_3rscan_df(
-        dataset_root: Union[str, Path],
-        *,
-        limit: Optional[int] = None,
-        log_every: int = 50_000,
-    ) -> Path:
-        """Build a single `meta.parquet` for 3RScan.
+    dataset_root: Union[str, Path],
+    *,
+    limit: Optional[int] = None,
+    log_every: int = 50_000,
+    modality: list[str] = ["image", "graph"],
+    scene_ids: Optional[Set[str]] = None,
+) -> pd.DataFrame:
+    """Build a metadata dataframe for 3RScan, optionally restricted to a scene subset."""
+    root = Path(dataset_root)
 
-        The resulting file contains:
-        - `idx` (int): unique row id
-        - `scene` (str): scene id (folder name under `scenes/`)
-        - `pose` (list[float]): [tx, ty, tz, qx, qy, qz, qw] in world coordinates
-        - `image_path` (str): absolute path to RGB frame (`*.color.jpg`)
-        """
-        root = Path(dataset_root)
+    rows: List[Dict[str, Any]] = []
+    n = 0
 
-        rows: List[Dict[str, Any]] = []
-        n = 0
-
+    if scene_ids is None:
         logger.info("Scanning 3rscan dataset...")
+    else:
+        logger.info(f"Scanning 3rscan dataset for {len(scene_ids)} selected scenes...")
 
-        for scene_id, img_path, pose_path in iter_3rscan_frames(root):
-            try:
-                T_wc = _read_pose_matrix(pose_path)
-                pose7 = _matrix_to_pose7(T_wc)
-            except Exception:
-                logger.exception(f"Failed reading pose for {pose_path}")
-                continue
+    for scene_id, img_path, pose_path, graph_path in iter_3rscan_frames(root, modality=modality):
+        if scene_ids is not None and scene_id not in scene_ids:
+            continue
+        try:
+            T_wc = _read_pose_matrix(pose_path)
+            pose7 = _matrix_to_pose7(T_wc)
+        except Exception:
+            logger.exception(f"Failed reading pose for {pose_path}")
+            continue
 
-            rows.append(
-                {
-                    "idx": n,
-                    "scene": scene_id,
-                    "pose": pose7,
-                    "image_path": str(img_path),
-                }
-            )
-            n += 1
-            if log_every and (n % log_every == 0):
-                logger.info(f"Scanned {n:,} frames...")
-            if limit is not None and n >= limit:
-                break
+        rows.append(
+            {
+                "idx": n,
+                "scene": scene_id,
+                "pose": pose7,
+                "image_path": str(img_path),
+                "graph_path": str(graph_path),
+            }
+        )
+        n += 1
+        if log_every and (n % log_every == 0):
+            logger.info(f"Scanned {n:,} frames...")
+        if limit is not None and n >= limit:
+            break
 
-        if not rows:
+    if not rows:
+        if scene_ids is None:
             raise RuntimeError(f"No frames with poses found under {root}/scenes/*/sequence")
+        raise RuntimeError("No frames with poses found for the requested scene selection")
 
-        df = pd.DataFrame(rows)
-        logger.info(f"Scanned {n} rows")
+    df = pd.DataFrame(rows)
+    logger.info(f"Scanned {n} rows")
 
-        return df
+    return df
         
 
 class ThreeRScan(Dataset):
@@ -133,10 +239,16 @@ class ThreeRScan(Dataset):
         *,
         meta_path: Optional[Union[str, Path]] = None, 
         meta_file: str = "meta.parquet",
+        modality: list[str] = ["image", "graph"],
         rebuild_meta: bool = False,
         save_meta: bool = False,
         limit: Optional[int] = None,
+        scene_list_path: Optional[Union[str, Path]] = None,
+        scene_filter_mode: str = "all", # "all", "listed", "same_room_excluding_listed"
+        room_json_path: Union[str, Path] = "/mnt/external_usb_hdd/6YL/Datasets/3RScan/files/3RScan.json",
         image_transform: Any = DefaultImageTransform(resize=(320, 192), train=False),
+        graph_feat_dim: int = 4,
+        graph_rotate: bool = True,
     ) -> None:
     
         super().__init__()
@@ -144,25 +256,50 @@ class ThreeRScan(Dataset):
         if not self.dataset_root.exists():
             raise FileNotFoundError(f"Given dataset_root={self.dataset_root} doesn't exist")
 
-        self.meta_path = self.dataset_root / meta_file if meta_path is None else Path(meta_path) / meta_file  
-        
-        if self.meta_path.exists() and not rebuild_meta:
+        self.meta_path = self.dataset_root / meta_file if meta_path is None else Path(meta_path) / meta_file
+        if scene_list_path is None and scene_filter_mode != "all":
+            scene_list_path = self.dataset_root / "files" / "test_resplit_scans.txt"
+        self.scene_list_path = Path(scene_list_path) if scene_list_path is not None else None
+        self.scene_filter_mode = scene_filter_mode
+        self.room_json_path = Path(room_json_path)
+        selected_scene_ids = resolve_3rscan_scene_filter(
+            scene_list_path=self.scene_list_path,
+            scene_filter_mode=self.scene_filter_mode,
+            room_json_path=self.room_json_path,
+        )
+
+        can_use_cached_meta = self.meta_path.exists() and not rebuild_meta and selected_scene_ids is None
+        if can_use_cached_meta:
             self.df = pd.read_parquet(self.meta_path)
         else:
-            logger.info("Rebuilding metadata for 3rscan dataset" if self.meta_path.exists() else "Metadata didn't found, rebuilding metadata for 3rscan dataset")
-            self.df = build_3rscan_df(self.dataset_root, limit=limit)
-        
-        if limit is not None:
+            logger.info(
+                "Rebuilding metadata for 3rscan dataset"
+                if self.meta_path.exists()
+                else "Metadata not found, rebuilding metadata for 3rscan dataset"
+            )
+            self.df = build_3rscan_df(
+                self.dataset_root,
+                limit=limit,
+                modality=modality,
+                scene_ids=selected_scene_ids,
+            )
+
+        if selected_scene_ids is not None and can_use_cached_meta:
+            self.df = self.df[self.df["scene"].astype(str).isin(selected_scene_ids)].reset_index(drop=True)
+            self.df["idx"] = np.arange(len(self.df), dtype=np.int64)
+
+        if limit is not None and can_use_cached_meta:
             self.df = self.df.iloc[:limit].reset_index(drop=True)
+            self.df["idx"] = np.arange(len(self.df), dtype=np.int64)
 
         # missing cols checking
-        missing_cols = {"idx", "pose", "image_path"} - set(self.df.columns)
+        missing_cols = {"idx", "pose", "graph_path", "scene", "image_path"} - set(self.df.columns)
         if missing_cols:
-            raise ValueError(f"{self.meta_path} is missing columns: {sorted(missing_cols)}")
-        if "scene" not in self.df.columns:
-            self.df["scene"] = self.df["image_path"].map(lambda p: Path(p).parents[1].name)
-
+            raise ValueError(f"{self.meta_path} is missing columns: {sorted(missing_cols)}, {self.df.columns}")
+        
         self.image_transform = image_transform
+        self.graph_feat_dim = graph_feat_dim
+        self.graph_rotate = graph_rotate
 
         if save_meta:
             self.save_meta_parquet(self.meta_path, meta_file)
@@ -184,12 +321,37 @@ class ThreeRScan(Dataset):
             img = img.float() / 255.0
         return img
 
+    def _load_graph(self, graph_path: Union[str, Path]) -> Tensor:
+        if graph_path is None:
+            return None
+
+        graph = torch.load(graph_path, map_location="cpu")
+        graph = _sanitize_graph_obj(graph, feat_dim=self.graph_feat_dim)
+
+        if isinstance(graph, list):
+            out = []
+            for g in graph:
+                g = _ensure_nonempty(g, feat_dim=self.graph_feat_dim)
+                if self.graph_rotate:
+                    g = rotate_graph_features(g)
+                out.append(g)
+            return out
+
+        graph = _ensure_nonempty(graph, feat_dim=self.graph_feat_dim)
+
+        if self.graph_rotate:
+            graph = rotate_graph_features(graph)
+
+        return graph
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:  
         row = self.df.iloc[int(idx)]
         image_path = row["image_path"]
+        graph_path = row["graph_path"]
         scene = row["scene"]
         pose = torch.tensor(np.asarray(row["pose"], dtype=np.float32), dtype=torch.float32)
         image = self._load_image(image_path)
+        graph = self._load_graph(graph_path)
         return {
             "idx": torch.tensor(int(row["idx"]), dtype=torch.int64),
             # Keep the original scene id so callers can reason about rooms/scenes.
@@ -197,6 +359,7 @@ class ThreeRScan(Dataset):
             "scene": torch.tensor(hash(str(scene))),
             "pose": pose,
             "image_main": image,
+            "graph_main": graph,
         }
 
     @classmethod
@@ -205,59 +368,23 @@ class ThreeRScan(Dataset):
         *,
         room_json_path: Union[str, Path] = "/mnt/external_usb_hdd/6YL/Datasets/3RScan/files/3RScan.json",
     ) -> Dict[str, str]:
-        """
-        Build mapping `scene_id -> room_reference`.
-
-        In `3RScan.json`, scenes that belong to the same physical room are grouped under the same
-        top-level object, with the top-level `"reference"` and all entries from `"scans"[]."reference"`.
-        """
         if cls._scene_to_room_map is not None:
             return cls._scene_to_room_map
 
-        room_json_path = Path(room_json_path)
-        if not room_json_path.exists():
-            raise FileNotFoundError(f"Missing 3RScan room file: {room_json_path}")
+        cls._scene_to_room_map = build_scene_to_room_map(room_json_path=room_json_path)
+        return cls._scene_to_room_map
 
-        with room_json_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if not isinstance(data, list):
-            raise ValueError(f"Expected a JSON list at top-level in {room_json_path}")
-
-        scene_to_room: Dict[str, str] = {}
-        for entry in data:
-            if not isinstance(entry, dict):
-                continue
-            room_ref = entry.get("reference")
-            scans = entry.get("scans")
-            if room_ref is None or not isinstance(scans, list):
-                continue
-
-            # The room contains the top-level reference scan and all rescan references in "scans".
-            for scan_entry in [{"reference": room_ref}] + scans:
-                if not isinstance(scan_entry, dict):
-                    continue
-                scan_ref = scan_entry.get("reference")
-                if scan_ref is None:
-                    continue
-                scene_to_room[str(scan_ref)] = str(room_ref)
-
-        if not scene_to_room:
-            raise RuntimeError(f"Failed to build scene->room mapping from {room_json_path}")
-
-        cls._scene_to_room_map = scene_to_room
-        return scene_to_room
-
-    def is_same_room_and_pose(
+    def similarity_check(
         self,
         a: Dict[str, Any],
         b: Dict[str, Any],
-        *,
+        *,  
+        mode: str = "pose", # "pose" or "room"
         trans_tol_m: float = 3.0,
         rot_tol_deg: float = 60.0,
     ) -> bool:
         """
-        Return True iff:
+        Return True if:
         1) both samples belong to the same room (via `3RScan.json` grouping), and
         2) their pose is within `trans_tol_m` translation and `rot_tol_deg` rotation.
 
@@ -275,6 +402,9 @@ class ThreeRScan(Dataset):
         room_b = room_map.get(str(scene_id_b))
         if room_a is None or room_b is None or room_a != room_b:
             return False
+
+        if mode == "room" and room_a == room_b:
+            return True
 
         pose_a = a["pose"]
         pose_b = b["pose"]
@@ -324,11 +454,12 @@ class ThreeRScan(Dataset):
 
     @staticmethod
     def collate_fn(batch: Sequence[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        """Collate function that keeps paths/scenes as Python lists."""
+        """Collate function that keeps paths/scenes as Python lists.""" 
         return {
             "idxs": torch.stack([b["idx"] for b in batch], dim=0),
             "poses": torch.stack([b["pose"] for b in batch], dim=0),
             "images_main": torch.stack([b["image_main"] for b in batch], dim=0),
             "scenes": torch.stack([torch.tensor(hash(b["scene"])) for b in batch]),
+            "graphs_main": _collate_graph_objects([(b["graph_main"]) for b in batch], feat_dim=4),
         }
 
