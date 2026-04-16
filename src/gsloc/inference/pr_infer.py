@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Literal, Iterable
+from typing import Any, Dict, Optional, Literal, Iterable, Callable
 
 import numpy as np
 import torch
@@ -28,25 +28,17 @@ from mmpr.data.image import get_default_image_transform, SimpleImageLoader
 from mmpr.pr_cache import PerFramePR, load_pr_cache_npz, save_pr_cache_npz
 from mmpr.models import MegaLoc
 from mmpr.data.multimodal import SimpleMultimodalLoader
+from mmpr.seq_pr_benchmark import SequencePRBenchmarker, SequenceBenchmarkConfig
+from gsloc.datasets.pr_dataset import PRDataset
 from torchvision import transforms as T
 
 
 from torchvision.transforms import functional as F
 
-# image_transform_fn = T.Compose([
-#     T.ToTensor(),
-#     T.Lambda(lambda x: F.rotate(x, -90)),
-#     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-#     T.Resize([322, 322], antialias=True)
-# ])
+from torch_geometric.data import Batch as PyGBatch
+from torch_geometric.data import Data, HeteroData
 
-# def read_image(image_filepath: str | Path) -> Tensor:
-#     image = Image.open(image_filepath)
-#     image = image_transform_fn(image)
-#     return image
-
-# def to_batch(image: Tensor) -> dict[str, Tensor]:
-#     return {"images_0": image.unsqueeze(0)}
+from gsloc.utils.graphs import _collate_graph_objects
 
 
 @dataclass
@@ -62,23 +54,6 @@ class PRInferConfig:
     pr_quant_size: float = 0.05
 
 
-# class ImagePreprocessor:
-#     def __call__(self, image: Tensor) -> dict[str, Tensor]:
-#         return {"images_0": image.unsqueeze(0)}
-
-
-# class MultimodalPreprocessor:
-    
-#     def __init__(self, pr_quant_size: float = 0.05, use_intensity: bool = False) -> None:
-#         self.pc_pre = PointCloudMinkPreprocessor(quantization_size=pr_quant_size, use_intensity=use_intensity)
-#         self.image_pre = ImagePreprocessor()
-    
-#     def __call__(self, points: np.ndarray, image: Tensor) -> dict[str, Tensor]:
-#         image_input = self.image_pre(image)
-#         pc_input = self.pc_pre(points)
-#         return {**image_input, **pc_input}
-
-
 class PRInferencer:
     """Run place recognition on a dataset and cache PR results.
 
@@ -90,7 +65,8 @@ class PRInferencer:
     - resume/merge `pr_cache.npz` when some frames are already saved
     - build and reuse `query_cache_dir/descriptors.npy`, `meta.parquet`, `schema.json`
       so future runs don't re-run the model
-    - uses `batch_infer` (not `pipeline.infer` in a per-frame loop) to allow batching
+    - uses `batch_infer` when available; otherwise calls `infer` once per sample, passing
+      the same keys as the dataloader batch with tensors sliced as ``tensor[i : i + 1]``
     """
 
     def __init__(
@@ -98,7 +74,7 @@ class PRInferencer:
         cfg: PRInferConfig | None = None,
         *,
         pr_pipeline: PlaceRecognitionPipeline | None = None,
-        query_dataset: Dataset | None = None,
+        query_dataset: PRDataset | None = None,
         batch_size: int = 16,
         num_workers: int = 0,
         query_cache_dir: Path | None = None,
@@ -157,7 +133,16 @@ class PRInferencer:
         }
         schema_path.write_text(json.dumps(schema))
 
-    def _ensure_query_descriptors_cache(self, *, query_cache_dir: Path, rebuild: bool) -> np.ndarray:
+    def _ensure_query_descriptors_cache(
+        self, 
+        *, 
+        query_cache_dir: Path, 
+        rebuild: bool, 
+        loader: DataLoader | None = None,
+        infer: Callable | None = None,
+        k: int = 100,
+        ) -> np.ndarray:
+
         N = len(self.query_dataset)
         if not rebuild and query_cache_dir is not None:
             try:
@@ -173,10 +158,12 @@ class PRInferencer:
             batch_size=self._batch_size,
             shuffle=False,
             num_workers=self._num_workers,
-        )
+            infer=infer,
+        ) if loader is None else loader
+
         desc_parts: list[np.ndarray] = []
         for batch in tqdm(loader, desc="Compute query descriptors"):
-            desc_parts.append(self.pr.batch_infer_descriptors(batch))
+            desc_parts.append(infer(batch, k=k))
         descriptors = np.concatenate(desc_parts, axis=0)
         if descriptors.shape[0] != N:
             raise RuntimeError(f"Descriptor row count mismatch: {descriptors.shape[0]} != {N}")
@@ -215,6 +202,33 @@ class PRInferencer:
         k_final = int(self._k_default if k is None else k)
         q_cache_dir = query_cache_dir or self._query_cache_dir
 
+        batch_infer = getattr(self.pr, "batch_infer", None)
+        one_sample_infer = getattr(self.pr, "infer", None) if not callable(batch_infer) else None
+        if not callable(batch_infer) and not callable(one_sample_infer):
+            raise AttributeError(
+                "`pr` must define `batch_infer` or `infer` for full descriptor + PR rebuild"
+            )
+        # Full pass: use batch_infer to compute both descriptors and PR results.
+        if callable(batch_infer):
+            infer = batch_infer
+            loader = DataLoader(
+                self.query_dataset,
+                batch_size=self._batch_size,
+                shuffle=False,
+                num_workers=self._num_workers,
+                collate_fn=self.query_dataset.collate_fn,
+            )
+        else:
+            assert one_sample_infer is not None
+            infer = one_sample_infer
+            loader = DataLoader(
+                self.query_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=self._num_workers,
+                collate_fn=self.query_dataset.collate_fn,
+            )
+
         N = len(self.query_dataset)
         if rebuild_pr_cache:
             existing_frames: list[PerFramePR] = []
@@ -227,18 +241,11 @@ class PRInferencer:
         need_full_pr_rebuild = rebuild_query_descriptors or q_cache_dir is None or (not q_cache_dir.exists())
 
         if need_full_pr_rebuild:
-            # Full pass: use batch_infer to compute both descriptors and PR results.
-            loader = DataLoader(
-                self.query_dataset,
-                batch_size=self._batch_size,
-                shuffle=False,
-                num_workers=self._num_workers,
-                collate_fn=self.query_dataset.collate_fn,
-            )
             desc_parts: list[np.ndarray] = []
-            frames_full: list[PerFramePR] = []
+            frames_full: list[PerFramePR] = []   
+            
             for batch in tqdm(loader, desc="Compute descriptors + PR cache"):
-                results = self.pr.batch_infer(batch, k=k_final)
+                results = infer(batch, k=k_final)
                 desc_parts.append(
                     np.stack([result.descriptor for result in results], axis=0).astype(np.float32, copy=False)
                 )
@@ -263,7 +270,7 @@ class PRInferencer:
 
         # Fast path: use cached descriptors and resume/merge pr_cache.
         descriptors = self._ensure_query_descriptors_cache(
-            query_cache_dir=q_cache_dir, rebuild=False
+            query_cache_dir=q_cache_dir, rebuild=False, loader=loader, infer=infer, k=k_final
         )
         start_idx = len(existing_frames)
         if start_idx >= N:
@@ -300,7 +307,7 @@ class PRInferencer:
     def build_recall_benchmark_report(
         self,
         *,
-        database_dataset: Dataset | None = None,
+        database_dataset: PRDataset | None = None,
         ks: Iterable[int] | None = None,
         similarity_kwargs: dict[str, Any] | None = None,
         include_per_query: bool = False,
@@ -356,13 +363,6 @@ class PRInferencer:
             raise ValueError("`pr_pipeline` with a valid `index` is required to resolve database samples.")
 
 
-        def _sample_from_position(dataset, pos: int) -> dict[str, Any]:
-            raw = dataset[int(pos)]
-            if not isinstance(raw, dict):
-                raise TypeError("Dataset __getitem__ must return a dict for similarity benchmarking.")
-            return raw
-
-        db_sample_cache: dict[int, dict[str, Any]] = {}
         db_id_cache: dict[int, int] = {}
 
         num_queries = min(len(self.frames), len(self.query_dataset))
@@ -371,7 +371,7 @@ class PRInferencer:
 
         for query_pos in tqdm(range(num_queries)):
             frame = self.frames[query_pos]
-            q_sample = _sample_from_position(self.query_dataset,query_pos)
+            q_sample = self.query_dataset.sample_from_position(query_pos)
             db_row_positions = np.asarray(frame.indices, dtype=np.int64)
             db_ids = np.asarray(
                 frame.db_idx if frame.db_idx is not None else np.full(db_row_positions.shape, -1, dtype=np.int64),
@@ -381,7 +381,7 @@ class PRInferencer:
 
             hit_rank: int | None = None
             for rank, row_pos in enumerate(db_row_positions.tolist(), start=1):
-                db_sample = _sample_from_position(database_dataset, int(row_pos))
+                db_sample = database_dataset.sample_from_position(int(row_pos))
                 is_match = bool(self.query_dataset.similarity_check(q_sample, db_sample, **similarity_kwargs))
                 if is_match:
                     hit_rank = rank
@@ -392,6 +392,10 @@ class PRInferencer:
             if hit_rank is not None:
                 first_hit_rank[query_pos] = int(hit_rank)
 
+            if not include_per_query:
+                continue
+            
+            # Build per-query dataframe
             row: dict[str, Any] = {
                 "query_idx": int(query_pos),
                 "num_candidates": int(db_ids.shape[0]),
@@ -403,6 +407,7 @@ class PRInferencer:
                 ),
                 "top1_distance": (float(dists[0]) if dists.shape[0] > 0 else None),
             }
+           
             if query_df is not None and query_pos < len(query_df):
                 for key, value in query_df.iloc[query_pos].to_dict().items():
                     row[f"query_{key}"] = value
@@ -429,4 +434,65 @@ class PRInferencer:
             return summary_df
         return summary_df, pd.DataFrame(per_query_rows)
 
+    def build_sequence_recall_benchmark_report(
+        self,
+        *,
+        database_dataset: PRDataset | None = None,
+        # ks: Iterable[int] | None = None,
+        similarity_kwargs: dict[str, Any] | None = None,
+        seq_lengths: Iterable[int] = [5],
+        per_frame_k_used: int = 25,
+        save_dir: Path | None = None,
+    ) -> pd.DataFrame:
+
+        """Run or reuse sequence benchmark for a map across sequence lengths."""
+
+        if not self.frames:
+            raise ValueError("No frames available. Run `run()` first or load a cache before benchmarking.")
+        if self.query_dataset is None:
+            raise ValueError("`query_dataset` is required to compute benchmark report.")
+        if database_dataset is None:
+            raise ValueError("`database_dataset` is required to compute benchmark report.")
+        if not hasattr(self.query_dataset, "similarity_check"):
+            raise AttributeError("query_dataset must implement `similarity_check(a, b, ...)`.")
+
+        similarity_kwargs = {} if similarity_kwargs is None else dict(similarity_kwargs)
+        
+        
+        all_rows: list[dict] = []
+        for W in tqdm(list(seq_lengths)):
+            cfg_b = SequenceBenchmarkConfig(
+                q_df=self.query_dataset.df,
+                db_df=database_dataset.df,
+                frames=self.frames,
+                max_window=int(W),
+                per_frame_k_used=per_frame_k_used,
+                final_k=self._k_default,
+                recency_weighting="none",
+                similarity_func=self.query_dataset.similarity_check,
+                similarity_kwargs=similarity_kwargs,
+            )
+
+            bench = SequencePRBenchmarker(cfg_b)
+            artifacts = bench.run()
+
+            if save_dir is not None:
+                save_dir = Path(save_dir)
+                save_dir.mkdir(parents=True, exist_ok=True)
+                bench.save(artifacts, save_dir)
+
+            all_rows.append({
+                "w": int(W),
+                "auc_pr": float(artifacts.auc_pr),
+                "f1_max": float(artifacts.f1_max),
+                "recall_at_1": float(artifacts.recall_at_k.get(1, 0.0)),
+                "recall_at_5": float(artifacts.recall_at_k.get(5, 0.0)),
+                "recall_at_10": float(artifacts.recall_at_k.get(10, 0.0)),
+                "recall_at_25": float(artifacts.recall_at_k.get(25, 0.0)),
+                "num_valid": int(artifacts.num_queries_valid),
+                "num_total": int(artifacts.num_queries_total),
+            })
+
+        df = pd.DataFrame(all_rows).sort_values("w").reset_index(drop=True)
+        return df
 

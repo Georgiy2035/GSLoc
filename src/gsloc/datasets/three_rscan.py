@@ -23,7 +23,7 @@ import torch
 from loguru import logger
 from scipy.spatial.transform import Rotation as R
 from torch import Tensor
-from torch.utils.data import Dataset
+from gsloc.datasets.pr_dataset import PRDataset
 
 from opr.datasets.augmentations import DefaultImageTransform
 from mmpr.modules.vis_utils import quaternion_angle
@@ -228,7 +228,7 @@ def build_3rscan_df(
     return df
         
 
-class ThreeRScan(Dataset):
+class ThreeRScan(PRDataset):
     """3RScan dataset that loads RGB frames from all scenes."""
 
     _scene_to_room_map: Optional[Dict[str, str]] = None
@@ -268,7 +268,7 @@ class ThreeRScan(Dataset):
             room_json_path=self.room_json_path,
         )
 
-        can_use_cached_meta = self.meta_path.exists() and not rebuild_meta and selected_scene_ids is None
+        can_use_cached_meta = self.meta_path.exists() and not rebuild_meta #and selected_scene_ids is None
         if can_use_cached_meta:
             self.df = pd.read_parquet(self.meta_path)
         else:
@@ -283,6 +283,7 @@ class ThreeRScan(Dataset):
                 modality=modality,
                 scene_ids=selected_scene_ids,
             )
+        room_map = self._get_scene_to_room_map()
 
         if selected_scene_ids is not None and can_use_cached_meta:
             self.df = self.df[self.df["scene"].astype(str).isin(selected_scene_ids)].reset_index(drop=True)
@@ -302,10 +303,8 @@ class ThreeRScan(Dataset):
         self.graph_rotate = graph_rotate
 
         if save_meta:
-            self.save_meta_parquet(self.meta_path, meta_file)
+            self.save_meta_parquet(self.meta_path.parent, meta_file)
 
-    def __len__(self) -> int:  
-        return int(len(self.df))
 
     def _load_image(self, image_path: Union[str, Path]) -> Tensor:
         img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -390,13 +389,10 @@ class ThreeRScan(Dataset):
 
         Expected pose format is `[tx, ty, tz, qx, qy, qz, qw]`.
         """
-        room_map = self._get_scene_to_room_map()
+        room_map = self._scene_to_room_map
 
-        scene_id_a = a.get("scene_id", None)
-        scene_id_b = b.get("scene_id", None)
-        if scene_id_a is None or scene_id_b is None:
-            # We can't map hashed `scene` back to IDs reliably.
-            return False
+        scene_id_a = a.get("scene", None)
+        scene_id_b = b.get("scene", None)
 
         room_a = room_map.get(str(scene_id_a))
         room_b = room_map.get(str(scene_id_b))
@@ -439,19 +435,7 @@ class ThreeRScan(Dataset):
 
         return True
 
-    def save_meta_parquet(
-        self,
-        meta_path: Optional[Union[str, Path]] = None,
-        meta_file: str = "meta.parquet"
-        ):
-
-        out = (Path(meta_path) / meta_file) if meta_path is not None else (self.dataset_root / meta_file)
-
-        out.parent.mkdir(parents=True, exist_ok=True)
-        self.df.to_parquet(out, index=False)
-        logger.info(f"Wrote {len(self.df):,} rows to {out}")
-        return out
-
+    
     @staticmethod
     def collate_fn(batch: Sequence[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         """Collate function that keeps paths/scenes as Python lists.""" 

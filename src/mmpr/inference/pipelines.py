@@ -21,6 +21,7 @@ import open3d as o3d
 import torch
 from scipy.spatial.transform import Rotation
 from torch import Tensor, nn
+from gsloc.utils.graphs import _collate_graph_objects
 # import MinkowskiEngine as ME
 
 from mmpr.inference.data import (
@@ -104,6 +105,80 @@ def _matrix_to_pose7(T: np.ndarray) -> np.ndarray:
     return np.concatenate([t, q]).astype(np.float64, copy=False)
 
 
+def _preprocess_input(device: torch.device, input_data: Dict[str, Tensor], **kwargs) -> Dict[str, Tensor]:
+        """Preprocess input data."""
+        out_dict: Dict[str, Tensor] = {}
+        print(input_data)
+        for key in input_data:
+            if key.startswith("image_"):
+                print(key)
+                out_dict[f"images_{key[6:]}"] = input_data[key].unsqueeze(0).to(device)
+            elif key.startswith("mask_"):
+                print(key)
+                out_dict[f"masks_{key[5:]}"] = input_data[key].unsqueeze(0).to(device)
+            elif key.startswith("graph_"):
+                print(key)
+                out_dict[f"graphs_{key[6:]}"] = _collate_graph_objects([input_data[key]], feat_dim=4).to(device, non_blocking=True)
+            elif key == "pointcloud_lidar_coords":
+                quantized_coords, quantized_feats = ME.utils.sparse_quantize(
+                    coordinates=input_data["pointcloud_lidar_coords"],
+                    features=input_data["pointcloud_lidar_feats"],
+                    quantization_size=kwargs.get("pointcloud_quantization_size", 0.5),
+                )
+                out_dict["pointclouds_lidar_coords"] = ME.utils.batched_coordinates([quantized_coords]).to(
+                    device
+                )
+                out_dict["pointclouds_lidar_feats"] = quantized_feats.to(device)
+            elif key == "soc":
+                out_dict["soc"] = input_data[key].unsqueeze(0).to(device)
+        print(out_dict)
+        return out_dict
+
+
+def _prepare_model_input_batch(device: torch.device, batch: Dict[str, Any]) -> Dict[str, Tensor]:
+        """Create model input dict from a collated batch."""
+        model_input: Dict[str, Tensor] = {}
+        for key, value in batch.items():
+            if key.startswith("images_"):
+                model_input[f"images_{key[7:]}"] = value.to(device, non_blocking=True)
+            elif key.startswith("masks_"):
+                model_input[f"masks_{key[6:]}"] = value.to(device, non_blocking=True)
+            elif key.startswith("graphs_"):
+                model_input[f"graphs_{key[7:]}"] = value.to(device, non_blocking=True)
+            elif key == "soc":
+                model_input[key] = value.to(device, non_blocking=True)
+            elif key in {"pointcloud_lidar_coords", "pointcloud_lidar_feats"}:
+                raise NotImplementedError(
+                    "Batched pointcloud preprocessing requires MinkowskiEngine. "
+                    "Use an image-only dataset or implement batched sparse quantization."
+                )
+
+        if not model_input:
+            raise KeyError(
+                "No usable tensor inputs found in batch. Expected at least one tensor key starting with `images_` or `graphs_`."
+            )
+        return model_input
+
+
+def _looks_like_collated_pr_batch(d: Dict[str, Any]) -> bool:
+    """True if ``d`` uses DataLoader-style keys (``images_*``, ``graphs_*``, …)."""
+    return any(
+        k.startswith("images_") or k.startswith("graphs_") or k.startswith("masks_")
+        for k in d
+    )
+
+
+def _extract_descriptors(out: dict[str, Tensor]) -> np.ndarray:
+        """Normalize model output into a float32 numpy descriptor batch."""
+        if "final_descriptor" not in out:
+            raise KeyError("Model output must contain 'final_descriptor'")
+        desc_t: Tensor = out["final_descriptor"]
+        if desc_t.ndim == 1:
+            desc_t = desc_t[None, :]
+        elif desc_t.ndim != 2:
+            raise ValueError("Expected descriptor tensor of shape [D] or [B,D]")
+        return desc_t.detach().cpu().numpy().astype(np.float32, copy=False)
+
 # =============================================================================
 # Place Recognition Pipeline
 # =============================================================================
@@ -135,63 +210,7 @@ class PlaceRecognitionPipeline:
         self.device = parse_device(device)
         self.model = init_model(model, model_weights_path, self.device)
         self.model.eval()
-
-    def _preprocess_input(self, input_data: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """Preprocess input data."""
-        out_dict: Dict[str, Tensor] = {}
-        for key in input_data:
-            if key.startswith("image_"):
-                out_dict[f"images_{key[6:]}"] = input_data[key].unsqueeze(0).to(self.device)
-            elif key.startswith("mask_"):
-                out_dict[f"masks_{key[5:]}"] = input_data[key].unsqueeze(0).to(self.device)
-            elif key == "pointcloud_lidar_coords":
-                quantized_coords, quantized_feats = ME.utils.sparse_quantize(
-                    coordinates=input_data["pointcloud_lidar_coords"],
-                    features=input_data["pointcloud_lidar_feats"],
-                    quantization_size=self._pointcloud_quantization_size,
-                )
-                out_dict["pointclouds_lidar_coords"] = ME.utils.batched_coordinates([quantized_coords]).to(
-                    self.device
-                )
-                out_dict["pointclouds_lidar_feats"] = quantized_feats.to(self.device)
-            elif key == "soc":
-                out_dict["soc"] = input_data[key].unsqueeze(0).to(self.device)
-        return out_dict
-
-    def _prepare_model_input_batch(self, batch: Dict[str, Any]) -> Dict[str, Tensor]:
-        """Create model input dict from a collated batch."""
-        model_input: Dict[str, Tensor] = {}
-        for key, value in batch.items():
-            if not isinstance(value, torch.Tensor):
-                continue
-            if key.startswith("image_"):
-                model_input[f"images_{key[6:]}"] = value.to(self.device, non_blocking=True)
-            elif key.startswith("mask_"):
-                model_input[f"masks_{key[5:]}"] = value.to(self.device, non_blocking=True)
-            elif key == "soc":
-                model_input[key] = value.to(self.device, non_blocking=True)
-            elif key in {"pointcloud_lidar_coords", "pointcloud_lidar_feats"}:
-                raise NotImplementedError(
-                    "Batched pointcloud preprocessing requires MinkowskiEngine. "
-                    "Use an image-only dataset or implement batched sparse quantization."
-                )
-
-        if not model_input:
-            raise KeyError(
-                "No usable tensor inputs found in batch. Expected at least one tensor key starting with `image_`."
-            )
-        return model_input
-
-    def _extract_descriptors(self, out: dict[str, Tensor]) -> np.ndarray:
-        """Normalize model output into a float32 numpy descriptor batch."""
-        if "final_descriptor" not in out:
-            raise KeyError("Model output must contain 'final_descriptor'")
-        desc_t: Tensor = out["final_descriptor"]
-        if desc_t.ndim == 1:
-            desc_t = desc_t[None, :]
-        elif desc_t.ndim != 2:
-            raise ValueError("Expected descriptor tensor of shape [D] or [B,D]")
-        return desc_t.detach().cpu().numpy().astype(np.float32, copy=False)
+    
 
     def _search_descriptors(self, descriptors: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
         """Run index search for a descriptor batch and map metadata."""
@@ -216,9 +235,9 @@ class PlaceRecognitionPipeline:
     @torch.inference_mode()
     def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
         """Run batched descriptor extraction."""
-        model_input = self._prepare_model_input_batch(batch)
+        model_input = _prepare_model_input_batch(self.device, batch)
         out = self.model(model_input)
-        return self._extract_descriptors(out)
+        return _extract_descriptors(out)
 
     @torch.inference_mode()
     def batch_infer(self, batch: Dict[str, Any], k: int = 5) -> list[PlaceRecognitionResult]:
@@ -227,11 +246,13 @@ class PlaceRecognitionPipeline:
         return self._search_descriptors(descriptors, k=k)
 
     @torch.inference_mode()
-    def infer(self, input_data: dict[str, Tensor], k: int = 5) -> PlaceRecognitionResult:
+    def infer(self, input_data: dict[str, Any], k: int = 5) -> PlaceRecognitionResult:
         """Run a single-sample inference and top-k search.
 
         Args:
-            input_data: Dict of tensors expected by the model forward.
+            input_data: Legacy keys ``image_*`` / ``graph_*`` (unbatched tensors), or collated
+                keys ``images_*`` / ``graphs_*`` with batch dimension 1 (same layout as
+                ``batch_infer``).
             k: Number of neighbors to retrieve.
 
         Returns:
@@ -242,9 +263,12 @@ class PlaceRecognitionPipeline:
             ValueError: If the produced descriptor has an unexpected shape.
         """
         with torch.no_grad():
-            model_input = self._preprocess_input(input_data)
+            if _looks_like_collated_pr_batch(input_data):
+                model_input = _prepare_model_input_batch(self.device, input_data)
+            else:
+                model_input = _preprocess_input(self.device, input_data)
             out = self.model(model_input)
-        descriptors = self._extract_descriptors(out)
+        descriptors = _extract_descriptors(out)
         if descriptors.shape[0] != 1:
             raise ValueError("Expected a single descriptor for single-sample inference")
         return self._search_descriptors(descriptors, k=k)[0]
@@ -342,7 +366,12 @@ class SequencePlaceRecognitionPipeline:
         final_k = int(k) if k is not None else self.final_k
 
         # 1) Forward pass: single-frame descriptor
-        out = self.model(input_frame)
+        with torch.no_grad():
+            if _looks_like_collated_pr_batch(input_frame):
+                model_input = _prepare_model_input_batch(self.device, input_frame)
+            else:
+                model_input = _preprocess_input(self.device, input_frame)
+            out = self.model(model_input)
         if "final_descriptor" not in out:
             raise KeyError("Model output must contain 'final_descriptor'")
         desc_t: Tensor = out["final_descriptor"]
@@ -416,7 +445,7 @@ class SequencePlaceRecognitionPipeline:
         )
 
         if not return_debug:
-            return fused_res
+            return [fused_res]
 
         debug = SequencePRDebug(
             per_frame_indices=per_i,
@@ -426,7 +455,7 @@ class SequencePlaceRecognitionPipeline:
             window_size=len(self._records),
             descriptor_agg=self.descriptor_agg,
         )
-        return fused_res, debug
+        return [fused_res], debug
 
     # --- internal helpers ---
 
