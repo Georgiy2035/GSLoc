@@ -443,6 +443,8 @@ class PRInferencer:
         seq_lengths: Iterable[int] = [5],
         per_frame_k_used: int = 25,
         save_dir: Path | None = None,
+        std_mode: Literal["scene", "global"] = "global",
+        scene_df_field: str | None = "scene",
     ) -> pd.DataFrame:
 
         """Run or reuse sequence benchmark for a map across sequence lengths."""
@@ -471,13 +473,15 @@ class PRInferencer:
                 recency_weighting="none",
                 similarity_func=self.query_dataset.similarity_check,
                 similarity_kwargs=similarity_kwargs,
+                std_mode=std_mode,
+                scene_df_field=scene_df_field,
             )
 
             bench = SequencePRBenchmarker(cfg_b)
             artifacts = bench.run()
 
             if save_dir is not None:
-                save_dir = Path(save_dir)
+                save_dir = Path(save_dir) / f"{W:03d}-window"
                 save_dir.mkdir(parents=True, exist_ok=True)
                 bench.save(artifacts, save_dir)
 
@@ -486,9 +490,13 @@ class PRInferencer:
                 "auc_pr": float(artifacts.auc_pr),
                 "f1_max": float(artifacts.f1_max),
                 "recall_at_1": float(artifacts.recall_at_k.get(1, 0.0)),
+                "recall_at_1_std": float(artifacts.recall_at_k_std.get(1, 0.0)),
                 "recall_at_5": float(artifacts.recall_at_k.get(5, 0.0)),
+                "recall_at_5_std": float(artifacts.recall_at_k_std.get(5, 0.0)),
                 "recall_at_10": float(artifacts.recall_at_k.get(10, 0.0)),
+                "recall_at_10_std": float(artifacts.recall_at_k_std.get(10, 0.0)),
                 "recall_at_25": float(artifacts.recall_at_k.get(25, 0.0)),
+                "recall_at_25_std": float(artifacts.recall_at_k_std.get(25, 0.0)),
                 "num_valid": int(artifacts.num_queries_valid),
                 "num_total": int(artifacts.num_queries_total),
             })

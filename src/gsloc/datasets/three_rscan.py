@@ -69,11 +69,16 @@ def iter_3rscan_frames(
         seq_dir = scene_dir / "sequence"
         if not seq_dir.exists():
             continue
-        for img_path in sorted(seq_dir.glob("*.color.jpg")):
-            pose_path = img_path.with_suffix("").with_suffix(".pose.txt")  # frame-XXXXXX.pose.txt
-            graph_path = root / "Splited_graphs" / scene_id / (img_path.with_suffix("").with_suffix("").name + ".pt")
-            if pose_path.exists():
-                yield scene_id, img_path, pose_path, graph_path
+        frame = dict()
+        for pose_path in sorted(seq_dir.glob("*.pose.txt")):
+            frame["pose_path"] = pose_path
+            frame["scene_id"] = scene_id
+            if "image" in modality:
+                frame["image_path"] = pose_path.with_suffix("").with_suffix(".color.jpg")  # frame-XXXXXX.pose.txt
+            if "graph" in modality:
+                frame["graph_path"] = root / "Splited_graphs" / scene_id / (pose_path.with_suffix("").with_suffix("").name + ".pt")
+            if all(frame.values()):
+                yield frame
 
 
 def _load_scene_ids(scene_list_path: Union[str, Path]) -> Set[str]:
@@ -180,6 +185,7 @@ def build_3rscan_df(
     log_every: int = 50_000,
     modality: list[str] = ["image", "graph"],
     scene_ids: Optional[Set[str]] = None,
+    scene_to_room_map: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """Build a metadata dataframe for 3RScan, optionally restricted to a scene subset."""
     root = Path(dataset_root)
@@ -192,25 +198,27 @@ def build_3rscan_df(
     else:
         logger.info(f"Scanning 3rscan dataset for {len(scene_ids)} selected scenes...")
 
-    for scene_id, img_path, pose_path, graph_path in iter_3rscan_frames(root, modality=modality):
-        if scene_ids is not None and scene_id not in scene_ids:
+    for frame in iter_3rscan_frames(root, modality=modality):
+        if scene_ids is not None and frame["scene_id"] not in scene_ids:
             continue
         try:
-            T_wc = _read_pose_matrix(pose_path)
+            T_wc = _read_pose_matrix(frame["pose_path"])
             pose7 = _matrix_to_pose7(T_wc)
         except Exception:
-            logger.exception(f"Failed reading pose for {pose_path}")
+            logger.exception(f"Failed reading pose for {frame['pose_path']}")
             continue
 
-        rows.append(
-            {
-                "idx": n,
-                "scene": scene_id,
-                "pose": pose7,
-                "image_path": str(img_path),
-                "graph_path": str(graph_path),
-            }
-        )
+
+        row = dict()
+        row["idx"] = n
+        row["scene"] = frame["scene_id"]
+        row["room"] = scene_to_room_map.get(frame["scene_id"], None)
+        row["pose"] = pose7
+        if "image" in modality:
+            row["image_path"] = str(frame.get("image_path", None))
+        if "graph" in modality:
+            row["graph_path"] = str(frame.get("graph_path", None))
+        rows.append(row)
         n += 1
         if log_every and (n % log_every == 0):
             logger.info(f"Scanned {n:,} frames...")
@@ -253,6 +261,7 @@ class ThreeRScan(PRDataset):
     
         super().__init__()
         self.dataset_root = Path(dataset_root)
+        self.modality = modality
         if not self.dataset_root.exists():
             raise FileNotFoundError(f"Given dataset_root={self.dataset_root} doesn't exist")
 
@@ -282,8 +291,9 @@ class ThreeRScan(PRDataset):
                 limit=limit,
                 modality=modality,
                 scene_ids=selected_scene_ids,
+                scene_to_room_map=self._get_scene_to_room_map(),
             )
-        room_map = self._get_scene_to_room_map()
+        
 
         if selected_scene_ids is not None and can_use_cached_meta:
             self.df = self.df[self.df["scene"].astype(str).isin(selected_scene_ids)].reset_index(drop=True)
@@ -345,21 +355,23 @@ class ThreeRScan(PRDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:  
         row = self.df.iloc[int(idx)]
-        image_path = row["image_path"]
-        graph_path = row["graph_path"]
         scene = row["scene"]
+        room = row["room"]
         pose = torch.tensor(np.asarray(row["pose"], dtype=np.float32), dtype=torch.float32)
-        image = self._load_image(image_path)
-        graph = self._load_graph(graph_path)
-        return {
+
+        frame = {
             "idx": torch.tensor(int(row["idx"]), dtype=torch.int64),
             # Keep the original scene id so callers can reason about rooms/scenes.
-            "scene_id": str(scene),
-            "scene": torch.tensor(hash(str(scene))),
+            "scene": str(scene),
+            "room": str(room),
+            "scene_hash": torch.tensor(hash(str(scene))),
             "pose": pose,
-            "image_main": image,
-            "graph_main": graph,
         }
+        if "image" in self.modality:
+            frame["image_main"] = self._load_image(row["image_path"])
+        if "graph" in self.modality:
+            frame["graph_main"] = self._load_graph(row["graph_path"])
+        return frame
 
     @classmethod
     def _get_scene_to_room_map(
@@ -389,13 +401,10 @@ class ThreeRScan(PRDataset):
 
         Expected pose format is `[tx, ty, tz, qx, qy, qz, qw]`.
         """
-        room_map = self._scene_to_room_map
 
-        scene_id_a = a.get("scene", None)
-        scene_id_b = b.get("scene", None)
+        room_a = a.get("room", None)
+        room_b = b.get("room", None)
 
-        room_a = room_map.get(str(scene_id_a))
-        room_b = room_map.get(str(scene_id_b))
         if room_a is None or room_b is None or room_a != room_b:
             return False
 
@@ -439,11 +448,14 @@ class ThreeRScan(PRDataset):
     @staticmethod
     def collate_fn(batch: Sequence[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         """Collate function that keeps paths/scenes as Python lists.""" 
-        return {
+        out = {
             "idxs": torch.stack([b["idx"] for b in batch], dim=0),
             "poses": torch.stack([b["pose"] for b in batch], dim=0),
-            "images_main": torch.stack([b["image_main"] for b in batch], dim=0),
-            "scenes": torch.stack([torch.tensor(hash(b["scene"])) for b in batch]),
-            "graphs_main": _collate_graph_objects([(b["graph_main"]) for b in batch], feat_dim=4),
+            "scenes_hashes": torch.stack([b["scene_hash"] for b in batch], dim=0),
         }
+        if "image_main" in batch[0].keys():
+            out["images_main"] = torch.stack([b["image_main"] for b in batch], dim=0)
+        if "graph_main" in batch[0].keys():
+            out["graphs_main"] = _collate_graph_objects([(b["graph_main"]) for b in batch], feat_dim=4)
+        return out
 

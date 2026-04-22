@@ -21,6 +21,7 @@ class EmulatorConfig:
 def emulate_sequence_fusion(
     frames: list[PerFramePR],
     cfg: EmulatorConfig,
+    scene_data: list[str] | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Emulate SequencePlaceRecognitionPipeline fusion over cached per-frame PR results.
 
@@ -36,11 +37,19 @@ def emulate_sequence_fusion(
     win_d: list[np.ndarray] = []
     win_i: list[np.ndarray] = []
 
-    for f in frames:
+    for i, f in enumerate(frames):
         di = f.distances if per_k_used is None else f.distances[:per_k_used]
         ii = f.indices if per_k_used is None else f.indices[:per_k_used]
+        
         win_d.append(di.astype(np.float32, copy=False))
         win_i.append(ii.astype(np.int64, copy=False))
+
+        if scene_data is not None: 
+            if scene_data[i] != scene_data[i-1]:
+                while len(win_d) > 1:
+                    win_d.pop(0)
+                    win_i.pop(0)
+        
         if len(win_d) > max_window:
             win_d.pop(0)
             win_i.pop(0)

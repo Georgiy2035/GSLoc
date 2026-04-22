@@ -8,6 +8,7 @@ import json
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
+import random
 
 from opr.inference.index import FaissFlatIndex
 
@@ -30,11 +31,14 @@ class SequenceBenchmarkConfig:
     recency_weighting: Literal["none", "linear", "exp"] = "none"
     similarity_func: Callable[[dict, dict], bool] = lambda a, b, **kwargs: False
     similarity_kwargs: dict[str, Any] | None = None
+    std_mode: Literal["scene", "global"] = "scene"
+    scene_df_field: str | None = "scene"
 
 
 @dataclass
 class BenchmarkArtifacts:
     recall_at_k: dict[int, float]
+    recall_at_k_std: dict[int, float]
     auc_pr: float
     f1_max: float
     max_recall_at_prec1: float
@@ -81,7 +85,14 @@ class SequencePRBenchmarker:
         #     **self.cfg.similarity_kwargs,
         # )
         self.valid_indices = list(range(len(self.cfg.q_df)))
+        Ks = list(range(1, 26))
+        if self.cfg.std_mode == "scene":
+            scene_stats = {scene: {k: [] for k in Ks} for scene in self.cfg.q_df[self.cfg.scene_df_field].unique()}
+        else:
+            scene_stats = {scene: {k: [] for k in Ks} for scene in range(len(self.valid_indices) // 100)}
         
+        scene_data = list(self.cfg.q_df[self.cfg.scene_df_field]) if self.cfg.scene_df_field is not None else None
+
         # Emulate sequence fusion
         cfg = EmulatorConfig(
             max_window=int(self.cfg.max_window),
@@ -89,7 +100,7 @@ class SequencePRBenchmarker:
             final_k=int(self.cfg.final_k),
             recency_weighting=str(self.cfg.recency_weighting),
         )
-        fused = emulate_sequence_fusion(self.cfg.frames, cfg)
+        fused = emulate_sequence_fusion(self.cfg.frames, cfg, scene_data=scene_data)
         print("rankings creation started")
         # Build rankings and db_idx->xyz cache
         
@@ -108,16 +119,26 @@ class SequencePRBenchmarker:
 
         print("ranking iteration started")
         # Recall@K (K in [1..25]) on valid subset
-        Ks = list(range(1, 26))
         recalls = {k: [] for k in Ks}
         for qid in self.valid_indices:
             dists, db_ids = rankings[qid]
             is_pos = np.array([oracle(qid, int(db)) for db in db_ids], dtype=bool)
             stats = recall_at_k_per_query(db_ids, is_pos, Ks)
+
+            random_scene = random.randint(0, len(scene_stats) - 1)
             for k in Ks:
                 recalls[k].append(stats[k])
-        recall_at_k = {k: float(np.mean(recalls[k]) if len(recalls[k]) > 0 else 0.0) for k in Ks}
+                if self.cfg.std_mode == "scene":
+                    scene_stats[self.cfg.q_df.iloc[qid][self.cfg.scene_df_field]][k].append(stats[k])
+                else:
+                    scene_stats[random_scene][k].append(stats[k])
         
+        recall_at_k = {k: float(np.mean(recalls[k]) if len(recalls[k]) > 0 else 0.0) for k in Ks}
+
+        scene_recall_at_k = {k: {scene: float(np.mean(scene_stats[scene][k]) if len(scene_stats[scene][k]) > 0 else 0.0) for scene in scene_stats.keys()} for k in Ks}
+        recall_at_k_std = {k: np.std(list(scene_recall_at_k[k].values())) for k in Ks}
+        
+
         print("recall@k calculation started")
         # Micro PR curves/metrics on valid subset
         filtered_rankings = [rankings[i] for i in self.valid_indices]
@@ -148,6 +169,7 @@ class SequencePRBenchmarker:
 
         return BenchmarkArtifacts(
             recall_at_k=recall_at_k,
+            recall_at_k_std=recall_at_k_std,
             auc_pr=curves.auc_pr,
             f1_max=curves.f1_max,
             max_recall_at_prec1=curves.max_recall_at_prec1,
@@ -170,6 +192,7 @@ class SequencePRBenchmarker:
                 "recency_weighting": str(self.cfg.recency_weighting),
             },
             "recall_at_k": artifacts.recall_at_k,
+            "recall_at_k_std": artifacts.recall_at_k_std,
             "auc_pr": artifacts.auc_pr,
             "f1_max": artifacts.f1_max,
             "max_recall_at_prec1": artifacts.max_recall_at_prec1,
