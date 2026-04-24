@@ -41,6 +41,74 @@ from torch_geometric.data import Data, HeteroData
 from gsloc.utils.graphs import _collate_graph_objects
 
 
+def TwoModelsFrameMerge(
+    frames_a: list[PerFramePR],
+    frames_b: list[PerFramePR],
+    *,
+    distance_coef_a: float = 1.0,
+    distance_coef_b: float = 1.0,
+) -> list[PerFramePR]:
+    """Merge two parallel ``PerFramePR`` sequences into one ranked list per frame.
+
+    For each query index, candidates from ``frames_a`` and ``frames_b`` are
+    concatenated. Distances from list ``a`` are multiplied by ``distance_coef_a``
+    and distances from list ``b`` by ``distance_coef_b``. The merged frame is
+    sorted by these scaled distances (ascending). ``indices`` and ``db_idx``
+    rows are permuted together with ``distances``.
+
+    Args:
+        frames_a: First model's per-frame PR list.
+        frames_b: Second model's per-frame PR list (same length as ``frames_a``).
+        distance_coef_a: Multiplier applied to every distance from ``frames_a``.
+        distance_coef_b: Multiplier applied to every distance from ``frames_b``.
+
+    Returns:
+        One ``PerFramePR`` per input frame, with ``K = K_a + K_b`` candidates each.
+
+    Raises:
+        ValueError: If the two frame lists have different lengths.
+    """
+    if len(frames_a) != len(frames_b):
+        raise ValueError(
+            f"Frame list length mismatch: {len(frames_a)} != {len(frames_b)}"
+        )
+    ca = float(distance_coef_a)
+    cb = float(distance_coef_b)
+    merged: list[PerFramePR] = []
+    for fa, fb in zip(frames_a, frames_b):
+        dist_a = np.asarray(fa.distances, dtype=np.float32) * ca
+        dist_b = np.asarray(fb.distances, dtype=np.float32) * cb
+        idx_a = np.asarray(fa.indices, dtype=np.int64, copy=False)
+        idx_b = np.asarray(fb.indices, dtype=np.int64, copy=False)
+        d_all = np.concatenate([dist_a, dist_b])
+        i_all = np.concatenate([idx_a, idx_b])
+
+        has_a = fa.db_idx is not None
+        has_b = fb.db_idx is not None
+        if has_a and has_b:
+            db_a = np.asarray(fa.db_idx, dtype=np.int64, copy=False)
+            db_b = np.asarray(fb.db_idx, dtype=np.int64, copy=False)
+            db_all: np.ndarray | None = np.concatenate([db_a, db_b])
+        elif has_a:
+            ph = np.full(idx_b.shape, -1, dtype=np.int64)
+            db_all = np.concatenate([np.asarray(fa.db_idx, dtype=np.int64, copy=False), ph])
+        elif has_b:
+            ph = np.full(idx_a.shape, -1, dtype=np.int64)
+            db_all = np.concatenate([ph, np.asarray(fb.db_idx, dtype=np.int64, copy=False)])
+        else:
+            db_all = None
+
+        order = np.argsort(d_all, kind="mergesort")
+        d_sorted = d_all[order].astype(np.float32, copy=False)
+        i_sorted = i_all[order].astype(np.int64, copy=False)
+        if db_all is not None:
+            db_sorted = db_all[order].astype(np.int64, copy=False)
+        else:
+            db_sorted = None
+        merged.append(PerFramePR(indices=i_sorted, distances=d_sorted, db_idx=db_sorted))
+    return merged
+
+
 @dataclass
 class PRInferConfig:
     df: pd.Dataframe
@@ -481,9 +549,9 @@ class PRInferencer:
             artifacts = bench.run()
 
             if save_dir is not None:
-                save_dir = Path(save_dir) / f"{W:03d}-window"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                bench.save(artifacts, save_dir)
+                w_save_dir = Path(save_dir) / f"{W:03d}-window"
+                w_save_dir.mkdir(parents=True, exist_ok=True)
+                bench.save(artifacts, w_save_dir)
 
             all_rows.append({
                 "w": int(W),
@@ -502,5 +570,6 @@ class PRInferencer:
             })
 
         df = pd.DataFrame(all_rows).sort_values("w").reset_index(drop=True)
+        df.to_parquet(save_dir / "summaryresults.parquet")
         return df
 

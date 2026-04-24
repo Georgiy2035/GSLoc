@@ -22,7 +22,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any, Dict, Optional
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
@@ -40,6 +40,41 @@ except Exception as e:
     raise ImportError(
         "FAISS is required for FaissFlatIndex. Please install faiss-cpu or faiss-gpu."
     ) from e
+
+
+def _infer_model_device(model: nn.Module) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _move_collated_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    non_blocking = device.type == "cuda"
+    for k, v in batch.items():
+        if v is None:
+            out[k] = None
+        elif hasattr(v, "to"):
+            out[k] = v.to(device, non_blocking=non_blocking)
+        else:
+            out[k] = v
+    return out
+
+
+def _descriptor_tensor_from_output(out: Any) -> torch.Tensor:
+    if isinstance(out, dict):
+        if "final_descriptor" not in out:
+            raise KeyError("Model output must contain key 'final_descriptor'")
+        fd = out["final_descriptor"]
+        if isinstance(fd, dict) and "final_descriptor" in fd:
+            fd = fd["final_descriptor"]
+        if not isinstance(fd, torch.Tensor):
+            raise TypeError(f"final_descriptor must be a torch.Tensor, got {type(fd)}")
+        return fd
+    if isinstance(out, torch.Tensor):
+        return out
+    raise TypeError(f"Unexpected model output type: {type(out)}")
 
 
 # =============================================================================
@@ -405,10 +440,12 @@ class FaissFlatIndex(Index):
                         collate_fn=dataset.collate_fn
                     )
                 descriptors = []
+                device = _infer_model_device(model)
                 with torch.no_grad():
                     for batch in tqdm(dataloader):
-                        batch = {k: v.to("cuda") for k, v in batch.items()}
-                        final_descriptor = model(batch)["final_descriptor"]
+                        batch = _move_collated_batch_to_device(batch, device)
+                        raw = model(batch)
+                        final_descriptor = _descriptor_tensor_from_output(raw)
                         descriptors.append(final_descriptor.detach().cpu().numpy())
                 descriptors = np.concatenate(descriptors, axis=0)
                 

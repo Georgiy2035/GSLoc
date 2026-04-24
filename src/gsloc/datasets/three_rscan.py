@@ -28,6 +28,7 @@ from gsloc.datasets.pr_dataset import PRDataset
 from opr.datasets.augmentations import DefaultImageTransform
 from mmpr.modules.vis_utils import quaternion_angle
 from gsloc.utils.graphs import _sanitize_graph_obj, _ensure_nonempty, rotate_graph_features, _collate_graph_objects
+from gsloc.models.graph_encoder import EdgeAttrNormalizer
 
 
 def _read_pose_matrix(pose_path: Path) -> np.ndarray:
@@ -55,7 +56,8 @@ def _matrix_to_pose7(T_wc: np.ndarray) -> List[float]:
 
 def iter_3rscan_frames(
     dataset_root: Union[str, Path], 
-    modality: list[str] = ["image", "graph"]
+    modality: list[str] = ["image", "graph"],
+    graph_dir: str = "SceneGraphs_real_classes_pt_compact"
     ) -> Iterable[Tuple[str, Path, Path]]:
 
     """Yield (scene_id, image_path, pose_path) for all frames that have a pose."""
@@ -76,7 +78,7 @@ def iter_3rscan_frames(
             if "image" in modality:
                 frame["image_path"] = pose_path.with_suffix("").with_suffix(".color.jpg")  # frame-XXXXXX.pose.txt
             if "graph" in modality:
-                frame["graph_path"] = root / "Splited_graphs" / scene_id / (pose_path.with_suffix("").with_suffix("").name + ".pt")
+                frame["graph_path"] = root / graph_dir / scene_id / (pose_path.with_suffix("").with_suffix("").name + ".pt")
             if all(frame.values()):
                 yield frame
 
@@ -186,6 +188,7 @@ def build_3rscan_df(
     modality: list[str] = ["image", "graph"],
     scene_ids: Optional[Set[str]] = None,
     scene_to_room_map: Optional[Dict[str, str]] = None,
+    graph_dir: str = "SceneGraphs_real_classes_pt_compact",
 ) -> pd.DataFrame:
     """Build a metadata dataframe for 3RScan, optionally restricted to a scene subset."""
     root = Path(dataset_root)
@@ -198,7 +201,7 @@ def build_3rscan_df(
     else:
         logger.info(f"Scanning 3rscan dataset for {len(scene_ids)} selected scenes...")
 
-    for frame in iter_3rscan_frames(root, modality=modality):
+    for frame in iter_3rscan_frames(root, modality=modality, graph_dir=graph_dir):
         if scene_ids is not None and frame["scene_id"] not in scene_ids:
             continue
         try:
@@ -256,7 +259,10 @@ class ThreeRScan(PRDataset):
         room_json_path: Union[str, Path] = "/mnt/external_usb_hdd/6YL/Datasets/3RScan/files/3RScan.json",
         image_transform: Any = DefaultImageTransform(resize=(320, 192), train=False),
         graph_feat_dim: int = 4,
+        graph_edge_attr_dim: int = 7,
         graph_rotate: bool = True,
+        edge_normalizer_path: Optional[Union[str, Path]] = None,
+        graph_dir: str = "SceneGraphs_real_classes_pt_compact",
     ) -> None:
     
         super().__init__()
@@ -292,6 +298,7 @@ class ThreeRScan(PRDataset):
                 modality=modality,
                 scene_ids=selected_scene_ids,
                 scene_to_room_map=self._get_scene_to_room_map(),
+                graph_dir=graph_dir,
             )
         
 
@@ -310,7 +317,42 @@ class ThreeRScan(PRDataset):
         
         self.image_transform = image_transform
         self.graph_feat_dim = graph_feat_dim
+        self.graph_edge_attr_dim = graph_edge_attr_dim
         self.graph_rotate = graph_rotate
+        self.edge_normalizer: Optional[EdgeAttrNormalizer] = None
+        self._edge_norm_dim_mismatch_warned = False
+        _norm_path = Path(edge_normalizer_path) if edge_normalizer_path is not None else None
+        if _norm_path is not None:
+            if _norm_path.is_file():
+                try:
+                    norm_ckpt = torch.load(_norm_path, map_location="cpu", weights_only=False)
+                    self.edge_normalizer = EdgeAttrNormalizer(
+                        log_indices=norm_ckpt.get("log_indices"),
+                    )
+                    self.edge_normalizer.mean = torch.as_tensor(
+                        norm_ckpt["mean"], dtype=torch.float32
+                    )
+                    self.edge_normalizer.std = torch.as_tensor(
+                        norm_ckpt["std"], dtype=torch.float32
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to load edge normalizer from {}; continuing without it",
+                        _norm_path,
+                    )
+                    self.edge_normalizer = None
+            else:
+                logger.warning(
+                    "Edge normalizer checkpoint not found at {}; graph edge_attr will not be normalized",
+                    _norm_path,
+                )
+                self.edge_normalizer = None
+        else:
+            logger.warning(
+                "Edge normalizer path is None; graph edge_attr will not be normalized",
+            )
+            self.edge_normalizer = None
+        
 
         if save_meta:
             self.save_meta_parquet(self.meta_path.parent, meta_file)
@@ -330,28 +372,64 @@ class ThreeRScan(PRDataset):
             img = img.float() / 255.0
         return img
 
-    def _load_graph(self, graph_path: Union[str, Path]) -> Tensor:
+
+    def _load_graph(self, graph_path: Union[str, Path, None]) -> Tensor:
         if graph_path is None:
             return None
 
-        graph = torch.load(graph_path, map_location="cpu")
-        graph = _sanitize_graph_obj(graph, feat_dim=self.graph_feat_dim)
+        graph = torch.load(graph_path, map_location="cpu", weights_only=False)
+
+        graph = _sanitize_graph_obj(
+            graph,
+            feat_dim=self.graph_feat_dim,
+            feat_edge_attr_dim=self.graph_edge_attr_dim,
+        )
 
         if isinstance(graph, list):
             out = []
             for g in graph:
-                g = _ensure_nonempty(g, feat_dim=self.graph_feat_dim)
+                g = _ensure_nonempty(g, self.graph_feat_dim, self.graph_edge_attr_dim)
                 if self.graph_rotate:
                     g = rotate_graph_features(g)
+                self._apply_edge_normalizer(g)
                 out.append(g)
             return out
 
-        graph = _ensure_nonempty(graph, feat_dim=self.graph_feat_dim)
+        graph = _ensure_nonempty(graph, self.graph_feat_dim, self.graph_edge_attr_dim)
 
         if self.graph_rotate:
             graph = rotate_graph_features(graph)
 
+        self._apply_edge_normalizer(graph)
+
         return graph
+
+    def _apply_edge_normalizer(self, graph: Any) -> None:
+        if self.edge_normalizer is None:
+            return
+        ea = getattr(graph, "edge_attr", None)
+        if ea is None or ea.numel() == 0:
+            return
+        m = self.edge_normalizer.mean
+        s = self.edge_normalizer.std
+        if m is None or s is None:
+            return
+        m_n = torch.as_tensor(m).numel()
+        if m_n != ea.shape[1]:
+            if not self._edge_norm_dim_mismatch_warned:
+                self._edge_norm_dim_mismatch_warned = True
+                logger.warning(
+                    "Skipping edge normalization: normalizer stats dim {} != edge_attr dim {} "
+                    "(log once per dataset instance; edge_attr left unnormalized)",
+                    m_n,
+                    ea.shape[1],
+                )
+            return
+        try:
+            graph.edge_attr = self.edge_normalizer.transform(ea)
+        except Exception:
+            logger.exception("Edge normalizer transform failed; leaving edge_attr unchanged")
+
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:  
         row = self.df.iloc[int(idx)]
@@ -444,11 +522,9 @@ class ThreeRScan(PRDataset):
 
         return True
 
-    
-    @staticmethod
-    def collate_fn(batch: Sequence[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        """Collate function that keeps paths/scenes as Python lists.""" 
-        out = {
+    def collate_fn(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        """Collate batches from ``__getitem__`` for DataLoader (needs bound ``dataset.collate_fn``)."""
+        out: Dict[str, Any] = {
             "idxs": torch.stack([b["idx"] for b in batch], dim=0),
             "poses": torch.stack([b["pose"] for b in batch], dim=0),
             "scenes_hashes": torch.stack([b["scene_hash"] for b in batch], dim=0),
@@ -456,6 +532,10 @@ class ThreeRScan(PRDataset):
         if "image_main" in batch[0].keys():
             out["images_main"] = torch.stack([b["image_main"] for b in batch], dim=0)
         if "graph_main" in batch[0].keys():
-            out["graphs_main"] = _collate_graph_objects([(b["graph_main"]) for b in batch], feat_dim=4)
+            out["graphs_main"] = _collate_graph_objects(
+                [b["graph_main"] for b in batch],
+                feat_dim=self.graph_feat_dim,
+                feat_edge_attr_dim=self.graph_edge_attr_dim,
+            )
         return out
 

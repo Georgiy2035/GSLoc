@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch, HeteroData
-from torch_geometric.nn import GINEConv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool, global_max_pool
 
 
 def _extract_embedding(x):
@@ -38,10 +38,10 @@ class VPRGraphEncoder(nn.Module):
                  n_layers=2,
                  proj_dim=64,
                  num_node_classes=None,
-                 node_emb_dim=16,
+                 node_emb_dim=64,
                  num_edge_classes=None,
-                 edge_emb_dim=16,
-                 dropout=0):
+                 edge_emb_dim=64,
+                 dropout=0.1):
         super().__init__()
 
         self.use_node_class = (num_node_classes is not None)
@@ -52,6 +52,7 @@ class VPRGraphEncoder(nn.Module):
             self.node_emb = nn.Embedding(num_node_classes, node_emb_dim)
             nn.init.xavier_uniform_(self.node_emb.weight)
 
+        
         self.edge_emb = None
         self.edge_proj = None
         if self.use_edge_label:
@@ -93,7 +94,6 @@ class VPRGraphEncoder(nn.Module):
         self._proj_dim = proj_dim
 
     def forward(self, batch):
-        batch = batch["graphs_main"]
         x = batch.x
 
         #print("batch in forward", batch)
@@ -121,58 +121,69 @@ class VPRGraphEncoder(nn.Module):
 
         z = self.proj(hg)
         z = F.normalize(z, p=2, dim=1)
-        output = {"final_descriptor": z}
-        return output
+        return z
 
     @property
     def out_dim(self):
         return self._proj_dim
 
+
+
 class MultiModalVPRGraphEncoder(nn.Module):
-    """Fuses a frozen MegaLoc-style image tower (8448-D) with ``VPRGraphEncoder``.
-
-    Module layout matches checkpoints such as ``best_model.pth`` (``graph_encoder.*``,
-    ``graph_gate``, ``graph_proj``, ``image_proj``, ``fuse_norm``, ``fuse_mlp``).
-    Image-backbone weights are not stored in that checkpoint; only ``image_encoder`` hub
-    weights are used unless you load them separately.
-    """
-
     def __init__(
         self,
-        graph_encoder: nn.Module,
-        image_encoder: nn.Module,
-        *,
-        image_out_dim: int = 8448,
-        fusion_dim: int = 8448,
-        graph_fusion_scale: float = 0.05,
-        fuse_mlp_residual_scale: float = 0.1,
-        normalize: bool = True,
-        mode: str = "fusion",
-        freeze_image_encoder: bool = True,
+        graph_encoder,
+        image_encoder,
+        image_out_dim=8448,
+        graph_out_dim=128,
+        fusion_dim=256,
+        normalize=True,
+        graph_fusion_scale=0.05,
+        freeze_image_encoder=True,
+        train_only_aggregator=True,  
     ):
         super().__init__()
+
         self.graph_encoder = graph_encoder
         self.image_encoder = image_encoder
         self.normalize = normalize
-        self.mode = mode
         self.graph_fusion_scale = graph_fusion_scale
-        self.fuse_mlp_residual_scale = fuse_mlp_residual_scale
+        self.freeze_image_encoder = freeze_image_encoder
+        self.train_only_aggregator = train_only_aggregator
 
-        graph_dim = int(getattr(graph_encoder, "out_dim"))
-        if graph_dim <= 0:
-            raise ValueError("graph_encoder must expose a positive out_dim")
+        if freeze_image_encoder and self.image_encoder is not None:
+            for p in self.image_encoder.parameters():
+                p.requires_grad = False
+            
+            
+            if train_only_aggregator:
+                # Разморозить только aggregator внутри image_encoder
+                """
+                if not hasattr(self.image_encoder, "aggregator"):
+                    raise AttributeError("image_encoder has no attribute 'aggregator'")
+                for p in self.image_encoder.aggregator.parameters():
+                    p.requires_grad = True
+                """
+                for p in self.image_encoder.aggregator.linear.parameters():
+                    p.requires_grad = True
 
-        self.graph_proj = nn.Sequential(
-            nn.Linear(graph_dim, fusion_dim),
-            nn.ReLU(inplace=True),
-            nn.LayerNorm(fusion_dim),
-        )
-        self.graph_gate = nn.Sequential(nn.Linear(graph_dim, fusion_dim))
         self.image_proj = nn.Sequential(
             nn.Linear(image_out_dim, fusion_dim),
             nn.ReLU(inplace=True),
             nn.LayerNorm(fusion_dim),
         )
+
+        self.graph_proj = nn.Sequential(
+            nn.Linear(graph_out_dim, fusion_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(fusion_dim),
+        )
+
+        self.graph_gate = nn.Sequential(
+            nn.Linear(graph_out_dim, fusion_dim),
+            nn.Sigmoid(),
+        )
+
         self.fuse_norm = nn.LayerNorm(fusion_dim)
         self.fuse_mlp = nn.Sequential(
             nn.Linear(fusion_dim, fusion_dim),
@@ -180,76 +191,124 @@ class MultiModalVPRGraphEncoder(nn.Module):
             nn.Linear(fusion_dim, fusion_dim),
         )
 
-        if freeze_image_encoder:
-            for p in self.image_encoder.parameters():
-                p.requires_grad = False
+        self._out_dim = fusion_dim
+        
+    def forward(self, graph=None, image=None, mode="fusion", return_parts=False):
+        out = {}
 
-        self._fusion_dim = fusion_dim
-        self._graph_dim = graph_dim
+        graph_z = None
+        image_z = None
+
+        if mode in ("graph", "fusion"):
+            if graph is None:
+                raise ValueError("graph is required for mode='graph' or 'fusion'")
+            graph_z = self.graph_encoder(graph)  # [B, graph_out_dim]
+            out["graph"] = graph_z
+
+        if mode in ("image", "fusion"):
+            if image is None:
+                raise ValueError("image is required for mode='image' or 'fusion'")
+            # if self.freeze_image_encoder:
+            #    with torch.no_grad():
+            #        image_raw = self.image_encoder(image)  # [B, 8448]
+            #else:
+            image_raw = self.image_encoder(image)
+
+            # image_z = self.image_proj(image_raw)  # [B, fusion_dim]
+            out["image"] = image_raw
+
+        if mode == "graph":
+            z = graph_z
+            out["fused"] = z
+            return out if return_parts else z
+
+        if mode == "image":
+            z = image_raw
+            # if self.normalize:
+            #    z = F.normalize(z, p=2, dim=1)
+            out["fused"] = z
+            return out if return_parts else z
+
+        graph_feat = self.graph_proj(graph_z)
+        gate = self.graph_gate(graph_z)
+
+        fused = image_raw + self.graph_fusion_scale * gate * graph_z
+        fused = self.fuse_norm(fused)
+        fused = fused + 0.1 * self.fuse_mlp(fused)
+
+        if self.normalize:
+            fused = F.normalize(fused, p=2, dim=1)
+
+        out["fused"] = fused
+        return out if return_parts else fused
 
     @property
     def out_dim(self):
-        return self._graph_dim if self.mode == "graph" else self._fusion_dim
+        return self._out_dim
 
-    def freeze_graph(self):
-        for p in self.graph_encoder.parameters():
-            p.requires_grad = False
 
-    def unfreeze_graph(self):
-        for p in self.graph_encoder.parameters():
-            p.requires_grad = True
+class EdgeAttrNormalizer:
+    def __init__(self, log_indices=None, eps=1e-6):
+        self.log_indices = log_indices
+        self.eps = eps
 
-    def freeze_image(self):
-        for p in self.image_encoder.parameters():
-            p.requires_grad = False
+        self.count = 0
+        self.mean = None
+        self.M2 = None
 
-    def unfreeze_image(self):
-        for p in self.image_encoder.parameters():
-            p.requires_grad = True
+    def _preprocess(self, x):
+        x = x.clone()
 
-    def forward(self, batch: dict, return_parts: bool = False):
-        del return_parts  # API compatibility; always return a dict for pipelines.
-        out: dict = {}
-        graph = batch.get("graphs_main")
-        image = batch.get("images_main")
+        if self.log_indices:
+            x[:, self.log_indices] = torch.log1p(x[:, self.log_indices])
+        
+        return x
+    
+    def update(self, x):
+        if x is None or x.numel() == 0:
+            return
 
-        if self.mode == "graph":
-            if graph is None:
-                raise ValueError("mode='graph' requires batch['graphs_main']")
-            g_out = self.graph_encoder(batch)
-            z = _extract_embedding(g_out)
-            out["graph"] = z
-            out["final_descriptor"] = z
-            return out
+        x = self._preprocess(x).double()
 
-        if self.mode == "image":
-            if image is None:
-                raise ValueError("mode='image' requires batch['images_main']")
-            raw = self.image_encoder(batch)
-            z_img = _extract_embedding(raw)
-            feat = self.image_proj(z_img)
-            if self.normalize:
-                feat = F.normalize(feat, p=2, dim=1)
-            out["image"] = feat
-            out["final_descriptor"] = feat
-            return out
+        if self.mean is None:
+            self.mean = torch.zeros(x.shape[1], dtype=torch.float64)
+            self.M2 = torch.zeros(x.shape[1], dtype=torch.float64)
 
-        if self.mode == "fusion":
-            if graph is None or image is None:
-                raise ValueError("mode='fusion' requires batch['graphs_main'] and batch['images_main']")
-            graph_z = _extract_embedding(self.graph_encoder(batch))
-            image_raw = _extract_embedding(self.image_encoder(batch))
-            graph_feat = self.graph_proj(graph_z)
-            gate = self.graph_gate(graph_z)
-            image_feat = self.image_proj(image_raw)
-            fused = image_feat + self.graph_fusion_scale * gate * graph_feat
-            fused = self.fuse_norm(fused)
-            fused = fused + self.fuse_mlp_residual_scale * self.fuse_mlp(fused)
-            if self.normalize:
-                fused = F.normalize(fused, p=2, dim=1)
-            out["graph"] = graph_z
-            out["image"] = image_feat
-            out["final_descriptor"] = fused
-            return out
+        n = x.shape[0]
 
-        raise ValueError(f"Unknown mode: {self.mode}")
+        new_count = self.count + n
+        delta = x.mean(dim=0) - self.mean
+
+        new_mean = self.mean + delta * n / new_count
+
+        m_a = self.M2
+        m_b = ((x - x.mean(dim=0))**2).sum(dim=0)
+
+        M2 = m_a + m_b + delta**2 * self.count * n / new_count
+
+        self.mean = new_mean
+        self.M2 = M2
+        self.count = new_count
+
+    def finalize(self):
+        if self.count < 2:
+            raise RuntimeError("Not enough data to compute std")
+
+        var = self.M2 / (self.count - 1)
+        self.std = torch.sqrt(var).float()
+        self.mean = self.mean.float()
+
+    def transform(self, x):
+        if x is None or x.numel() == 0:
+            return x
+
+        x = self._preprocess(x)
+        if self.mean is None or self.std is None:
+            return x
+        mean = torch.as_tensor(self.mean, dtype=x.dtype, device=x.device)
+        std = torch.as_tensor(self.std, dtype=x.dtype, device=x.device)
+        if mean.shape[0] != x.shape[1]:
+            raise ValueError(
+                f"EdgeAttrNormalizer: mean/std dim {mean.shape[0]} != edge_attr dim {x.shape[1]}"
+            )
+        return (x - mean) / (std + self.eps)

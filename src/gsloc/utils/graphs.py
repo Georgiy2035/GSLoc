@@ -4,7 +4,7 @@ from torch_geometric.data import Batch as PyGBatch
 from torch_geometric.data import Data, HeteroData
 
 
-def dict_to_pyg_data(d, feat_dim=4, edge_attr_dim=7):
+def dict_to_pyg_data(d, feat_dim, edge_attr_dim):
     if d is None:
         return None
 
@@ -104,12 +104,12 @@ def dict_to_pyg_data(d, feat_dim=4, edge_attr_dim=7):
     )
 
 
-def _ensure_nonempty(data_obj, feat_dim=4):
+def _ensure_nonempty(data_obj, feat_dim, feat_edge_attr_dim):
     if data_obj is None:
         return Data(
             x=torch.zeros((1, feat_dim), dtype=torch.float32),
             edge_index=torch.empty((2, 0), dtype=torch.long),
-            edge_attr=torch.empty((0, 7), dtype=torch.float32),
+            edge_attr=torch.empty((0, feat_edge_attr_dim), dtype=torch.float32),
             edge_label=torch.empty((0,), dtype=torch.long),
             edge_u_class=torch.empty((0,), dtype=torch.long),
             edge_v_class=torch.empty((0,), dtype=torch.long),
@@ -117,7 +117,7 @@ def _ensure_nonempty(data_obj, feat_dim=4):
         )
 
     if isinstance(data_obj, dict):
-        data_obj = dict_to_pyg_data(data_obj, feat_dim=feat_dim)
+        data_obj = dict_to_pyg_data(data_obj, feat_dim, feat_edge_attr_dim)
 
     if not isinstance(data_obj, (Data, HeteroData)):
         return data_obj
@@ -152,7 +152,7 @@ def _ensure_nonempty(data_obj, feat_dim=4):
 
     if synthetic_node:
         edge_index = torch.empty((2, 0), dtype=torch.long)
-        edge_attr = torch.empty((0, 7), dtype=torch.float32)
+        edge_attr = torch.empty((0, feat_edge_attr_dim), dtype=torch.float32)
         edge_label = torch.empty((0,), dtype=torch.long)
         edge_u_class = torch.empty((0,), dtype=torch.long)
         edge_v_class = torch.empty((0,), dtype=torch.long)
@@ -170,7 +170,7 @@ def _ensure_nonempty(data_obj, feat_dim=4):
 
         edge_attr = getattr(data_obj, "edge_attr", None)
         if edge_attr is None:
-            edge_attr = torch.empty((0, 7), dtype=torch.float32)
+            edge_attr = torch.empty((0, feat_edge_attr_dim), dtype=torch.float32)
         elif not torch.is_tensor(edge_attr):
             edge_attr = torch.tensor(np.asarray(edge_attr, dtype=float), dtype=torch.float32)
         else:
@@ -238,9 +238,7 @@ def _ensure_nonempty(data_obj, feat_dim=4):
         node_class=node_class,
     )
 
-
-
-def _sanitize_graph_obj(g, feat_dim=4):
+def _sanitize_graph_obj(g, feat_dim, feat_edge_attr_dim):
     if g is None:
         return None
 
@@ -249,12 +247,12 @@ def _sanitize_graph_obj(g, feat_dim=4):
         return [x for x in g.to_data_list()]
 
     if isinstance(g, dict):
-        g = dict_to_pyg_data(g, feat_dim=feat_dim)
+        g = dict_to_pyg_data(g, feat_dim, feat_edge_attr_dim)
 
     if isinstance(g, list):
         out = []
         for x in g:
-            sx = _sanitize_graph_obj(x, feat_dim=feat_dim)
+            sx = _sanitize_graph_obj(x, feat_dim, feat_edge_attr_dim)
             if sx is None:
                 continue
             if isinstance(sx, list):
@@ -307,7 +305,7 @@ def _sanitize_graph_obj(g, feat_dim=4):
 
     edge_attr = getattr(g, "edge_attr", None)
     if edge_attr is None:
-        edge_attr = torch.empty((0, 7), dtype=torch.float32)
+        edge_attr = torch.empty((0, feat_edge_attr_dim), dtype=torch.float32)
     elif not torch.is_tensor(edge_attr):
         edge_attr = torch.tensor(np.asarray(edge_attr, dtype=float), dtype=torch.float32)
     else:
@@ -418,23 +416,23 @@ def _graph_to_list(g):
     return [g]
 
 
-def _ensure_graph_list(graphs, feat_dim=4):
+def _ensure_graph_list(graphs, feat_dim, feat_edge_attr_dim=7):
     flat = []
     for g in _graph_to_list(graphs):
-        sg = _sanitize_graph_obj(g, feat_dim=feat_dim)
+        sg = _sanitize_graph_obj(g, feat_dim, feat_edge_attr_dim)
         if sg is None:
             continue
         if isinstance(sg, list):
             for x in sg:
-                x = _ensure_nonempty(_sanitize_graph_obj(x, feat_dim=feat_dim), feat_dim=feat_dim)
+                x = _ensure_nonempty(_sanitize_graph_obj(x, feat_dim, feat_edge_attr_dim), feat_dim, feat_edge_attr_dim)
                 flat.append(x)
         else:
-            flat.append(_ensure_nonempty(sg, feat_dim=feat_dim))
+            flat.append(_ensure_nonempty(sg, feat_dim, feat_edge_attr_dim))
     return flat
 
 
-def _collate_graph_objects(graphs, feat_dim=4):
-    graphs = _ensure_graph_list(graphs, feat_dim=feat_dim)
+def _collate_graph_objects(graphs, feat_dim, feat_edge_attr_dim=7):
+    graphs = _ensure_graph_list(graphs, feat_dim=feat_dim, feat_edge_attr_dim=feat_edge_attr_dim)
     if len(graphs) == 0:
         return None
     if isinstance(graphs[0], (Data, HeteroData)):

@@ -118,7 +118,9 @@ def _preprocess_input(device: torch.device, input_data: Dict[str, Tensor], **kwa
                 out_dict[f"masks_{key[5:]}"] = input_data[key].unsqueeze(0).to(device)
             elif key.startswith("graph_"):
                 print(key)
-                out_dict[f"graphs_{key[6:]}"] = _collate_graph_objects([input_data[key]], feat_dim=4).to(device, non_blocking=True)
+                out_dict[f"graphs_{key[6:]}"] = _collate_graph_objects(
+                    [input_data[key]], feat_dim=4, feat_edge_attr_dim=7
+                ).to(device, non_blocking=True)
             elif key == "pointcloud_lidar_coords":
                 quantized_coords, quantized_feats = ME.utils.sparse_quantize(
                     coordinates=input_data["pointcloud_lidar_coords"],
