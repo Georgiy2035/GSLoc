@@ -26,6 +26,7 @@ from mmpr.inference.pipelines import (
     PlaceRecognitionPipeline,
     RansacPointCloudRegistrationPipeline,
     SequencePlaceRecognitionPipeline,
+    PlaceRecognitionRerankPipeline
 )
 
 __all__ = [

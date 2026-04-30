@@ -157,6 +157,18 @@ class Index(ABC):
                   or "scans/000227.bin", or `numpy.nan` when not available.
         """
 
+    @abstractmethod
+    def distances_to_rows(self, queries: np.ndarray, row_positions: np.ndarray) -> np.ndarray:
+        """Raw distances from each query to database rows (same convention as ``search``).
+
+        Args:
+            queries: float32 [Q, D].
+            row_positions: int64 [Q, K] internal row ids (0..N-1).
+
+        Returns:
+            float32 [Q, K] distances aligned with ``row_positions``.
+        """
+
 
 # =============================================================================
 # IO Helpers
@@ -489,6 +501,23 @@ class FaissFlatIndex(Index):
         q = np.ascontiguousarray(queries.astype(np.float32, copy=False))
         distances, inds = self._index.search(q, k)
         return inds.astype(np.int64, copy=False), distances.astype(np.float32, copy=False)
+
+    def distances_to_rows(self, queries: np.ndarray, row_positions: np.ndarray) -> np.ndarray:
+        """Pairwise distances matching FAISS Flat (L2 squared, or negated IP)."""
+        q = np.ascontiguousarray(queries.astype(np.float32, copy=False))
+        rows = row_positions.astype(np.int64, copy=False)
+        if q.ndim != 2 or rows.ndim != 2:
+            raise ValueError(f"Expected queries [Q,D] and row_positions [Q,K]; got {q.shape}, {rows.shape}")
+        if q.shape[0] != rows.shape[0]:
+            raise ValueError(
+                f"Batch mismatch: queries Q={q.shape[0]} vs row_positions Q={rows.shape[0]}"
+            )
+        db_vecs = self._descriptors[rows]
+        if self._schema.metric == IndexMetric.L2:
+            diff = q[:, np.newaxis, :] - db_vecs
+            return np.sum(diff * diff, axis=-1, dtype=np.float32)
+        ip = np.sum(q[:, np.newaxis, :] * db_vecs, axis=-1, dtype=np.float32)
+        return (-ip).astype(np.float32, copy=False)
 
     def size(self) -> int:
         """Return number of database items (N)."""

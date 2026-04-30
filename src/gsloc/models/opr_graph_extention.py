@@ -6,6 +6,7 @@ from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool, global_max_p
 
 from gsloc.models.graph_encoder import VPRGraphEncoder
 from gsloc.models.graph_encoder import MultiModalVPRGraphEncoder
+from gsloc.models.graph_encoder import GATGraphEncoder
 
 class OPR_VPRGraphEncoder(VPRGraphEncoder):
     def __init__(self,
@@ -44,8 +45,6 @@ class OPR_VPRGraphEncoder(VPRGraphEncoder):
     @property
     def out_dim(self):
         return self._proj_dim
-
-
 
 class OPR_MultiModalVPRGraphEncoder(MultiModalVPRGraphEncoder):
     def __init__(
@@ -93,6 +92,49 @@ class OPR_MultiModalVPRGraphEncoder(MultiModalVPRGraphEncoder):
     @property
     def out_dim(self):
         return self._out_dim
+
+
+class OPR_GATGraphEncoder(GATGraphEncoder):
+    def __init__(self,
+                 in_dim,
+                 hidden_dim=256,
+                 n_layers=2,
+                 proj_dim=64,
+                 num_node_classes=None,
+                 node_emb_dim=64,
+                 num_edge_classes=None,
+                 edge_emb_dim=64,
+                 edge_cont_dim=10,
+                 dropout=0.1,
+                 heads=4):
+        super().__init__(
+            in_dim,
+            hidden_dim,
+            n_layers,
+            proj_dim,
+            num_node_classes,
+            node_emb_dim,
+            num_edge_classes,
+            edge_emb_dim,
+            edge_cont_dim,
+            dropout,
+            heads
+        )
+
+    def forward(self, batch):
+        if isinstance(batch, dict):
+            batch = batch["graphs_main"]
+
+        z = super().forward(batch)
+
+        output = {"final_descriptor": z}
+        return output
+
+    @property
+    def out_dim(self):
+        return self._proj_dim
+
+
 
 class EdgeAttrNormalizer:
     def __init__(self, log_indices=None, eps=1e-6):

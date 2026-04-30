@@ -501,6 +501,110 @@ class SequencePlaceRecognitionPipeline:
         return (self._running_sum_descriptor / count).astype(np.float32, copy=False)
 
 
+
+class PlaceRecognitionRerankPipeline:
+    """Minimal top-k Place Recognition pipeline using an `Index1` with `Index2` as reranker.
+
+    The pipeline assumes that the model returns a dict with key `final_descriptor`.
+    It returns raw FAISS distances with corresponding dataset indices and poses.
+    Index2 is used to rerank the results from Index1.
+    """
+
+    def __init__(
+        self,
+        index1: Index,
+        index2: Index,
+        model1: nn.Module,
+        model2: nn.Module,
+        model1_weights_path: str | Path | None = None,  
+        model2_weights_path: str | Path | None = None,
+        device: str | int | torch.device = "cpu",
+    ) -> None:
+        """Initialize the pipeline.
+
+        Args:
+            index: Loaded `Index` instance.
+            model: PyTorch model that outputs `{"final_descriptor": Tensor[B,D]}`.
+            model_weights_path: Optional path to weights to load.
+            device: Torch device spec.
+        """
+        self.index1 = index1
+        self.index2 = index2
+        self.device = parse_device(device)
+        self.model1 = init_model(model1, model1_weights_path, self.device)
+        self.model2 = init_model(model2, model2_weights_path, self.device)
+        self.model1.eval()
+        self.model2.eval()
+    
+
+    def _search_descriptors(self, descriptors1: np.ndarray, descriptors2: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
+        """Run index search for a descriptor batch and map metadata."""
+        inds, _ = self.index1.search(descriptors1, int(k))
+        dists = self.index2.distances_to_rows(descriptors2, inds)
+        order = np.argsort(dists, axis=1)
+        inds = np.take_along_axis(inds, order, axis=1)
+        dists = np.take_along_axis(dists, order, axis=1)
+        
+        db_idx, db_pose, _db_pc = self.index2.get_meta(inds.reshape(-1))
+        db_idx = db_idx.reshape(inds.shape)
+        db_pose = db_pose.reshape(*inds.shape, -1)
+
+        results: list[PlaceRecognitionResult] = []
+        for row in range(descriptors2.shape[0]):
+            results.append(
+                PlaceRecognitionResult(
+                    descriptor=descriptors2[row],
+                    indices=inds[row].astype(np.int64, copy=False),
+                    distances=dists[row].astype(np.float32, copy=False),
+                    db_idx=db_idx[row].astype(np.int64, copy=False),
+                    db_pose=db_pose[row].astype(np.float32, copy=False),
+                )
+            )
+        return results
+
+    @torch.inference_mode()
+    def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
+        """Run batched descriptor extraction."""
+        model_input = _prepare_model_input_batch(self.device, batch)
+        out1 = self.model1(model_input)
+        out2 = self.model2(model_input)
+        return _extract_descriptors(out1), _extract_descriptors(out2)
+
+    @torch.inference_mode()
+    def batch_infer(self, batch: Dict[str, Any], k: int = 5) -> list[PlaceRecognitionResult]:
+        """Run batched PR inference and return one result per sample."""
+        descriptors1, descriptors2 = self.batch_infer_descriptors(batch)
+        return self._search_descriptors(descriptors1, descriptors2, k=k)
+
+    @torch.inference_mode()
+    def infer(self, input_data: dict[str, Any], k: int = 5) -> PlaceRecognitionResult:
+        """Run a single-sample inference and top-k search.
+
+        Args:
+            input_data: Legacy keys ``image_*`` / ``graph_*`` (unbatched tensors), or collated
+                keys ``images_*`` / ``graphs_*`` with batch dimension 1 (same layout as
+                ``batch_infer``).
+            k: Number of neighbors to retrieve.
+
+        Returns:
+            PlaceRecognitionResult: descriptor, raw distances and mapped metadata.
+
+        Raises:
+            KeyError: If model output does not contain the `final_descriptor` key.
+            ValueError: If the produced descriptor has an unexpected shape.
+        """
+        with torch.no_grad():
+            if _looks_like_collated_pr_batch(input_data):
+                model_input = _prepare_model_input_batch(self.device, input_data)
+            else:
+                model_input = _preprocess_input(self.device, input_data)
+            out1 = self.model1(model_input)
+            out2 = self.model2(model_input)
+        descriptors1 = _extract_descriptors(out1)
+        descriptors2 = _extract_descriptors(out2)
+        if descriptors1.shape[0] != 1 or descriptors2.shape[0] != 1:
+            raise ValueError("Expected a single descriptor for single-sample inference")
+        return self._search_descriptors(descriptors1, descriptors2, k=k)[0]
 # =============================================================================
 # Registration Pipeline
 # =============================================================================

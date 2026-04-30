@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch, HeteroData
-from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GATv2Conv, GCNConv, GINEConv, global_mean_pool, global_max_pool
 
 
 def _extract_embedding(x):
@@ -31,6 +31,7 @@ def _extract_embedding(x):
     raise TypeError(f"Unsupported encoder output type: {type(x)}")
 
 
+
 class VPRGraphEncoder(nn.Module):
     def __init__(self,
                  in_dim,
@@ -41,28 +42,57 @@ class VPRGraphEncoder(nn.Module):
                  node_emb_dim=64,
                  num_edge_classes=None,
                  edge_emb_dim=64,
-                 dropout=0.1):
+                 edge_cont_dim=10,
+                 dropout=0.1,
+                 head=4):
         super().__init__()
 
         self.use_node_class = (num_node_classes is not None)
         self.use_edge_label = (num_edge_classes is not None)
+        self.edge_alpha = nn.Parameter(torch.tensor(0.0))
+        self.edge_cont_ln = nn.LayerNorm(hidden_dim)
+        self.edge_lbl_ln = nn.LayerNorm(hidden_dim)
 
         self.node_emb = None
         if self.use_node_class:
             self.node_emb = nn.Embedding(num_node_classes, node_emb_dim)
             nn.init.xavier_uniform_(self.node_emb.weight)
 
-        
         self.edge_emb = None
-        self.edge_proj = None
         if self.use_edge_label:
             self.edge_emb = nn.Embedding(num_edge_classes, edge_emb_dim)
             nn.init.xavier_uniform_(self.edge_emb.weight)
-            self.edge_proj = nn.Sequential(
+
+        self.edge_proj = None
+
+        self.edge_cont_mlp = nn.Sequential(
+            nn.Linear(edge_cont_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.edge_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+
+        if self.use_edge_label:
+            self.edge_label_proj = nn.Sequential(
                 nn.Linear(edge_emb_dim, hidden_dim),
                 nn.ReLU(inplace=True),
                 nn.Linear(hidden_dim, hidden_dim),
             )
+
+            self.edge_fuse = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+        else:
+            self.edge_label_proj = None
+            self.edge_fuse = None
+
 
         eff_in_dim = in_dim + (node_emb_dim if self.use_node_class else 0)
 
@@ -96,7 +126,6 @@ class VPRGraphEncoder(nn.Module):
     def forward(self, batch):
         x = batch.x
 
-        #print("batch in forward", batch)
         if self.use_node_class and hasattr(batch, 'node_class') and batch.node_class is not None:
             node_cls = batch.node_class.long().to(x.device)
             node_emb = self.node_emb(node_cls)
@@ -105,13 +134,177 @@ class VPRGraphEncoder(nn.Module):
         h = self.input_mlp(x)
 
         edge_attr = None
+        if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+            edge_attr_cont = batch.edge_attr[:,:].float().to(x.device) 
+            edge_cont = self.edge_cont_mlp(edge_attr_cont)
+        else:
+            edge_cont = None
+
         if self.use_edge_label and hasattr(batch, 'edge_label') and batch.edge_label is not None:
             edge_label = batch.edge_label.long().to(x.device)
-            edge_attr = self.edge_emb(edge_label)
-            edge_attr = self.edge_proj(edge_attr)
+            edge_lbl = self.edge_emb(edge_label)
+            edge_lbl = self.edge_label_proj(edge_lbl)
+
+            if edge_cont is not None:
+                # edge_attr = self.edge_fuse(torch.cat([edge_cont, edge_lbl], dim=1))
+                # gate = self.edge_gate(torch.cat([edge_cont, edge_lbl], dim=1))
+                # edge_attr = gate * edge_cont + (1 - gate) * edge_lbl
+                edge_attr = edge_lbl # + self.edge_alpha * edge_cont
+            else:
+                edge_attr = edge_lbl
 
         for conv in self.convs:
             h = conv(h, batch.edge_index, edge_attr)
+            h = self.act(h)
+            h = self.drop(h)
+
+        hg_mean = global_mean_pool(h, batch.batch)
+        hg_max = global_max_pool(h, batch.batch)
+        hg = torch.cat([hg_mean, hg_max], dim=1)
+
+        z = self.proj(hg)
+        z = F.normalize(z, p=2, dim=1)
+        return z
+
+    @property
+    def out_dim(self):
+        return self._proj_dim
+
+class GATGraphEncoder(nn.Module):
+    def __init__(self,
+                 in_dim,
+                 hidden_dim=256,
+                 n_layers=2,
+                 proj_dim=64,
+                 num_node_classes=None,
+                 node_emb_dim=64,
+                 num_edge_classes=None,
+                 edge_emb_dim=64,
+                 edge_cont_dim=10,
+                 dropout=0.1,
+                 heads=4):
+        super().__init__()
+
+        self.use_node_class = (num_node_classes is not None)
+        self.use_edge_label = (num_edge_classes is not None)
+        self.edge_alpha = nn.Parameter(torch.tensor(0.0))
+        self.edge_cont_ln = nn.LayerNorm(hidden_dim)
+        self.edge_lbl_ln = nn.LayerNorm(hidden_dim)
+
+        self.node_emb = None
+        if self.use_node_class:
+            self.node_emb = nn.Embedding(num_node_classes, node_emb_dim)
+            nn.init.xavier_uniform_(self.node_emb.weight)
+
+        self.edge_emb = None
+        if self.use_edge_label:
+            self.edge_emb = nn.Embedding(num_edge_classes, edge_emb_dim)
+            nn.init.xavier_uniform_(self.edge_emb.weight)
+
+        self.edge_proj = None
+
+        self.edge_cont_mlp = nn.Sequential(
+            nn.Linear(edge_cont_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.edge_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+
+        if self.use_edge_label:
+            self.edge_label_proj = nn.Sequential(
+                nn.Linear(edge_emb_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+
+            self.edge_fuse = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+        else:
+            self.edge_label_proj = None
+            self.edge_fuse = None
+
+
+        eff_in_dim = in_dim + (node_emb_dim if self.use_node_class else 0)
+
+        self.input_mlp = nn.Sequential(
+            nn.Linear(eff_in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+
+        self.convs = nn.ModuleList([
+            GATv2Conv(
+                in_channels=hidden_dim,
+                out_channels=hidden_dim,
+                heads=heads,
+                concat=False,      
+                dropout=dropout,
+                edge_dim=hidden_dim,
+                add_self_loops=True,
+                residual=True,
+            )
+            for _ in range(n_layers)
+        ])
+
+
+        self.act = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout(p=dropout)
+
+
+        self.pool_out_dim = hidden_dim * 2
+        self.proj = nn.Sequential(
+            nn.Linear(self.pool_out_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, proj_dim)
+        )
+        self._proj_dim = proj_dim
+
+    def forward(self, batch, return_attn=False):
+        x = batch.x
+
+        if self.use_node_class and hasattr(batch, 'node_class') and batch.node_class is not None:
+            node_cls = batch.node_class.long().to(x.device)
+            node_emb = self.node_emb(node_cls)
+            x = torch.cat([x, node_emb], dim=1)
+
+        h = self.input_mlp(x)
+
+        edge_attr = None
+        if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+            edge_attr_cont = batch.edge_attr[:,:].float().to(x.device) 
+            edge_cont = self.edge_cont_mlp(edge_attr_cont)
+        else:
+            edge_cont = None
+
+        if self.use_edge_label and hasattr(batch, 'edge_label') and batch.edge_label is not None:
+            edge_label = batch.edge_label.long().to(x.device)
+            edge_lbl = self.edge_emb(edge_label)
+            edge_lbl = self.edge_label_proj(edge_lbl)
+
+            if edge_cont is not None:
+                # edge_attr = self.edge_fuse(torch.cat([edge_cont, edge_lbl], dim=1))
+                # gate = self.edge_gate(torch.cat([edge_cont, edge_lbl], dim=1))
+                # edge_attr = gate * edge_cont + (1 - gate) * edge_lbl
+                edge_attr = edge_lbl # + self.edge_alpha * edge_cont
+            else:
+                edge_attr = edge_lbl
+        
+        attn_debug = None
+        for i, conv in enumerate(self.convs):
+            if return_attn and i == len(self.convs) - 1:
+                h, attn_debug = conv(h, batch.edge_index, edge_attr, return_attention_weights=True)
+            else:
+                h = conv(h, batch.edge_index, edge_attr)
+
             h = self.act(h)
             h = self.drop(h)
 
@@ -192,7 +385,6 @@ class MultiModalVPRGraphEncoder(nn.Module):
         )
 
         self._out_dim = fusion_dim
-        
     def forward(self, graph=None, image=None, mode="fusion", return_parts=False):
         out = {}
 
@@ -245,7 +437,6 @@ class MultiModalVPRGraphEncoder(nn.Module):
     @property
     def out_dim(self):
         return self._out_dim
-
 
 class EdgeAttrNormalizer:
     def __init__(self, log_indices=None, eps=1e-6):
@@ -303,12 +494,4 @@ class EdgeAttrNormalizer:
             return x
 
         x = self._preprocess(x)
-        if self.mean is None or self.std is None:
-            return x
-        mean = torch.as_tensor(self.mean, dtype=x.dtype, device=x.device)
-        std = torch.as_tensor(self.std, dtype=x.dtype, device=x.device)
-        if mean.shape[0] != x.shape[1]:
-            raise ValueError(
-                f"EdgeAttrNormalizer: mean/std dim {mean.shape[0]} != edge_attr dim {x.shape[1]}"
-            )
-        return (x - mean) / (std + self.eps)
+        return (x - self.mean) / (self.std + self.eps)
