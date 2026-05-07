@@ -57,7 +57,7 @@ def _matrix_to_pose7(T_wc: np.ndarray) -> List[float]:
 def iter_3rscan_frames(
     dataset_root: Union[str, Path], 
     modality: list[str] = ["image", "graph"],
-    graph_dir: str = "SceneGraphs_real_classes_pt_compact"
+    graph_path: Path | None = None, #graph dir with .pt files in scenes (depends on graph source - GT, FROSS or VLMGD)
     ) -> Iterable[Tuple[str, Path, Path]]:
 
     """Yield (scene_id, image_path, pose_path) for all frames that have a pose."""
@@ -78,7 +78,7 @@ def iter_3rscan_frames(
             if "image" in modality:
                 frame["image_path"] = pose_path.with_suffix("").with_suffix(".color.jpg")  # frame-XXXXXX.pose.txt
             if "graph" in modality:
-                frame["graph_path"] = root / graph_dir / scene_id / (pose_path.with_suffix("").with_suffix("").name + ".pt")
+                frame["graph_path"] = root / graph_path / scene_id / (pose_path.with_suffix("").with_suffix("").name + ".pt")
             if all(frame.values()):
                 yield frame
 
@@ -188,20 +188,28 @@ def build_3rscan_df(
     modality: list[str] = ["image", "graph"],
     scene_ids: Optional[Set[str]] = None,
     scene_to_room_map: Optional[Dict[str, str]] = None,
-    graph_dir: str = "SceneGraphs_real_classes_pt_compact",
+    graph_path: Path | None = None, #graph dir with .pt files in scenes (depends on graph source - GT, FROSS or VLMGD)
+    similarity_filter_mode: str = "none",  # "none", "pose", "room"
+    similarity_trans_tol_m: float = 3.0,
+    similarity_rot_tol_deg: float = 60.0,
 ) -> pd.DataFrame:
     """Build a metadata dataframe for 3RScan, optionally restricted to a scene subset."""
     root = Path(dataset_root)
 
     rows: List[Dict[str, Any]] = []
     n = 0
+    last_kept_by_scene: Dict[str, Dict[str, Any]] = {}
+    skipped_similar = 0
+
+    if similarity_filter_mode not in {"none", "pose", "room"}:
+        raise ValueError("`similarity_filter_mode` must be one of: 'none', 'pose', 'room'")
 
     if scene_ids is None:
         logger.info("Scanning 3rscan dataset...")
     else:
         logger.info(f"Scanning 3rscan dataset for {len(scene_ids)} selected scenes...")
 
-    for frame in iter_3rscan_frames(root, modality=modality, graph_dir=graph_dir):
+    for frame in iter_3rscan_frames(root, modality=modality, graph_path=graph_path):
         if scene_ids is not None and frame["scene_id"] not in scene_ids:
             continue
         try:
@@ -221,6 +229,49 @@ def build_3rscan_df(
             row["image_path"] = str(frame.get("image_path", None))
         if "graph" in modality:
             row["graph_path"] = str(frame.get("graph_path", None))
+
+        ###################FILTERING###################
+        if similarity_filter_mode != "none":
+            scene_id = str(row["scene"])
+            prev = last_kept_by_scene.get(scene_id)
+            if prev is not None:
+                room_a = prev.get("room", None)
+                room_b = row.get("room", None)
+                is_similar = False
+
+                if room_a is not None and room_b is not None and room_a == room_b:
+                    if similarity_filter_mode == "room":
+                        is_similar = True
+                    else:
+                        pose_a = torch.as_tensor(prev["pose"], dtype=torch.float64)
+                        pose_b = torch.as_tensor(row["pose"], dtype=torch.float64)
+
+                        t_a = pose_a[:3]
+                        t_b = pose_b[:3]
+                        trans_diff = float((t_a - t_b).norm())
+
+                        if trans_diff <= float(similarity_trans_tol_m):
+                            q_a = pose_a[3:]
+                            q_b = pose_b[3:]
+                            rot_diff_deg = quaternion_angle(
+                                q_a.detach().cpu().numpy(),
+                                q_b.detach().cpu().numpy(),
+                                degrees=True,
+                                normalize=True,
+                            )
+                            is_similar = rot_diff_deg <= float(similarity_rot_tol_deg)
+
+                if is_similar:
+                    skipped_similar += 1
+                    continue
+
+            last_kept_by_scene[scene_id] = {
+                "room": row["room"],
+                "pose": row["pose"],
+            }
+
+        ###################END OF FILTERING###################
+
         rows.append(row)
         n += 1
         if log_every and (n % log_every == 0):
@@ -235,6 +286,12 @@ def build_3rscan_df(
 
     df = pd.DataFrame(rows)
     logger.info(f"Scanned {n} rows")
+    if similarity_filter_mode != "none":
+        logger.info(
+            "Similarity filtering skipped {} sequential frames (mode={})",
+            skipped_similar,
+            similarity_filter_mode,
+        )
 
     return df
         
@@ -262,7 +319,10 @@ class ThreeRScan(PRDataset):
         graph_edge_attr_dim: int = 7,
         graph_rotate: bool = True,
         edge_normalizer_path: Optional[Union[str, Path]] = None,
-        graph_dir: str = "SceneGraphs_real_classes_pt_compact",
+        graph_path: Path | None = None, #graph dir with .pt files in scenes (depends on graph source - GT, FROSS or VLMGD)
+        similarity_filter_mode: str = "none",  # "none", "pose", "room"
+        similarity_trans_tol_m: float = 1.0,
+        similarity_rot_tol_deg: float = 15.0,
     ) -> None:
     
         super().__init__()
@@ -277,6 +337,9 @@ class ThreeRScan(PRDataset):
         self.scene_list_path = Path(scene_list_path) if scene_list_path is not None else None
         self.scene_filter_mode = scene_filter_mode
         self.room_json_path = Path(room_json_path)
+        self.similarity_filter_mode = similarity_filter_mode
+        self.similarity_trans_tol_m = float(similarity_trans_tol_m)
+        self.similarity_rot_tol_deg = float(similarity_rot_tol_deg)
         selected_scene_ids = resolve_3rscan_scene_filter(
             scene_list_path=self.scene_list_path,
             scene_filter_mode=self.scene_filter_mode,
@@ -298,7 +361,10 @@ class ThreeRScan(PRDataset):
                 modality=modality,
                 scene_ids=selected_scene_ids,
                 scene_to_room_map=self._get_scene_to_room_map(),
-                graph_dir=graph_dir,
+                graph_path=graph_path,
+                similarity_filter_mode=self.similarity_filter_mode,
+                similarity_trans_tol_m=self.similarity_trans_tol_m,
+                similarity_rot_tol_deg=self.similarity_rot_tol_deg,
             )
         
 
@@ -352,16 +418,43 @@ class ThreeRScan(PRDataset):
                 "Edge normalizer path is None; graph edge_attr will not be normalized",
             )
             self.edge_normalizer = None
-        
+
+        self._missing_asset_warn_count = 0
 
         if save_meta:
             self.save_meta_parquet(self.meta_path.parent, meta_file)
 
+    @staticmethod
+    def _coalesce_storage_path(row: Any, key: str) -> Optional[Path]:
+        """Return a filesystem path from a dataframe row, or None if missing/NaN/empty."""
+        if key not in row.index:
+            return None
+        v = row[key]
+        if v is None:
+            return None
+        try:
+            if pd.isna(v):
+                return None
+        except TypeError:
+            pass
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            return None
+        return Path(s)
 
-    def _load_image(self, image_path: Union[str, Path]) -> Tensor:
-        img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(f"Failed to read image: {image_path}")
+    def _warn_missing_asset(self, kind: str, path: Any, exc: Optional[BaseException] = None) -> None:
+        self._missing_asset_warn_count += 1
+        if self._missing_asset_warn_count <= 25:
+            if exc is not None:
+                logger.warning("Missing or unreadable {} {}: {} — {}", kind, path, type(exc).__name__, exc)
+            else:
+                logger.warning("Missing or unreadable {} {}", kind, path)
+        elif self._missing_asset_warn_count == 26:
+            logger.warning("Further missing image/graph file warnings suppressed (first 25 were logged)")
+
+    def _synthetic_image_tensor(self) -> Tensor:
+        """RGB zeros through the same transform path as real images (for missing/corrupt files)."""
+        img = np.zeros((240, 320, 3), dtype=np.uint8)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         if self.image_transform is not None:
             img = self.image_transform(img)
@@ -372,12 +465,49 @@ class ThreeRScan(PRDataset):
             img = img.float() / 255.0
         return img
 
+    def _placeholder_graph(self) -> Any:
+        """Single-node empty graph compatible with collate and the graph encoder."""
+        g = _ensure_nonempty(None, self.graph_feat_dim, self.graph_edge_attr_dim)
+        if self.graph_rotate:
+            g = rotate_graph_features(g)
+        self._apply_edge_normalizer(g)
+        return g
 
-    def _load_graph(self, graph_path: Union[str, Path, None]) -> Tensor:
+    def _load_image(self, image_path: Optional[Union[str, Path]]) -> Tensor:
+        if image_path is None:
+            self._warn_missing_asset("image", "(null path in meta)")
+            return self._synthetic_image_tensor()
+        p = Path(image_path)
+        if not p.is_file():
+            self._warn_missing_asset("image", p)
+            return self._synthetic_image_tensor()
+        img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        if img is None:
+            self._warn_missing_asset("image", p)
+            return self._synthetic_image_tensor()
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.image_transform is not None:
+            img = self.image_transform(img)
+        if not isinstance(img, torch.Tensor):
+            img = torch.from_numpy(np.ascontiguousarray(img))
+            if img.ndim == 3:
+                img = img.permute(2, 0, 1)  # HWC -> CHW
+            img = img.float() / 255.0
+        return img
+
+    def _load_graph(self, graph_path: Optional[Union[str, Path]]) -> Any:
         if graph_path is None:
-            return None
-
-        graph = torch.load(graph_path, map_location="cpu", weights_only=False)
+            self._warn_missing_asset("graph", "(null path in meta)")
+            return self._placeholder_graph()
+        p = Path(graph_path)
+        if not p.is_file():
+            self._warn_missing_asset("graph", p)
+            return self._placeholder_graph()
+        try:
+            graph = torch.load(p, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            self._warn_missing_asset("graph", p, exc)
+            return self._placeholder_graph()
 
         graph = _sanitize_graph_obj(
             graph,
@@ -446,9 +576,9 @@ class ThreeRScan(PRDataset):
             "pose": pose,
         }
         if "image" in self.modality:
-            frame["image_main"] = self._load_image(row["image_path"])
+            frame["image_main"] = self._load_image(self._coalesce_storage_path(row, "image_path"))
         if "graph" in self.modality:
-            frame["graph_main"] = self._load_graph(row["graph_path"])
+            frame["graph_main"] = self._load_graph(self._coalesce_storage_path(row, "graph_path"))
         return frame
 
     @classmethod

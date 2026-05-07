@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Any, Callable
+from typing import Literal, Any, Callable, List
+from time import perf_counter
 
 import json
 import numpy as np
@@ -33,6 +34,8 @@ class SequenceBenchmarkConfig:
     similarity_kwargs: dict[str, Any] | None = None
     std_mode: Literal["scene", "global"] = "scene"
     scene_df_field: str | None = "scene"
+    pose_df_field: str | None = "pose"
+    seq_filter_kwargs: dict[str, Any] | None = None
 
 
 @dataclass
@@ -92,6 +95,7 @@ class SequencePRBenchmarker:
             scene_stats = {scene: {k: [] for k in Ks} for scene in range(len(self.valid_indices) // 100)}
         
         scene_data = list(self.cfg.q_df[self.cfg.scene_df_field]) if self.cfg.scene_df_field is not None else None
+        pose_data = list(self.cfg.q_df[self.cfg.pose_df_field]) if self.cfg.pose_df_field is not None else None
 
         # Emulate sequence fusion
         cfg = EmulatorConfig(
@@ -100,8 +104,18 @@ class SequencePRBenchmarker:
             final_k=int(self.cfg.final_k),
             recency_weighting=str(self.cfg.recency_weighting),
         )
-        fused = emulate_sequence_fusion(self.cfg.frames, cfg, scene_data=scene_data)
-        print("rankings creation started")
+        t0 = perf_counter()
+        fused = emulate_sequence_fusion(
+            self.cfg.frames, 
+            cfg, 
+            scene_data=scene_data, 
+            pose_data=pose_data, 
+            seq_similarity_filter_mode=self.cfg.seq_filter_kwargs["seq_similarity_filter_mode"],
+            seq_similarity_trans_tol_m=self.cfg.seq_filter_kwargs["seq_similarity_trans_tol_m"], 
+            seq_similarity_rot_tol_deg=self.cfg.seq_filter_kwargs["seq_similarity_rot_tol_deg"]
+        )
+        dt = perf_counter() - t0
+        self.emulate_sequence_fusion_time_mean_s = dt / len(self.cfg.frames)
         # Build rankings and db_idx->xyz cache
         
         rankings: list[tuple[np.ndarray, np.ndarray]] = []
@@ -117,12 +131,19 @@ class SequencePRBenchmarker:
                 self.cfg.db_df.iloc[db_idx].to_dict(), 
                 **self.cfg.similarity_kwargs)
 
-        print("ranking iteration started")
+        def oracle_query(query_id: int, db_idx: [int]) -> bool:
+            q_dict = self.cfg.q_df.iloc[query_id].to_dict()
+            return [self.cfg.similarity_func(
+                q_dict, 
+                self.cfg.db_df.iloc[db].to_dict(), 
+                **self.cfg.similarity_kwargs) for db in db_idx]
+
         # Recall@K (K in [1..25]) on valid subset
         recalls = {k: [] for k in Ks}
+        is_pos_all = []
         for qid in self.valid_indices:
             dists, db_ids = rankings[qid]
-            is_pos = np.array([oracle(qid, int(db)) for db in db_ids], dtype=bool)
+            is_pos = np.array(oracle_query(qid, db_ids), dtype=bool)
             stats = recall_at_k_per_query(db_ids, is_pos, Ks)
 
             random_scene = random.randint(0, len(scene_stats) - 1)
@@ -132,47 +153,46 @@ class SequencePRBenchmarker:
                     scene_stats[self.cfg.q_df.iloc[qid][self.cfg.scene_df_field]][k].append(stats[k])
                 else:
                     scene_stats[random_scene][k].append(stats[k])
+            is_pos_all.append(is_pos)
         
         recall_at_k = {k: float(np.mean(recalls[k]) if len(recalls[k]) > 0 else 0.0) for k in Ks}
 
         scene_recall_at_k = {k: {scene: float(np.mean(scene_stats[scene][k]) if len(scene_stats[scene][k]) > 0 else 0.0) for scene in scene_stats.keys()} for k in Ks}
         recall_at_k_std = {k: np.std(list(scene_recall_at_k[k].values())) for k in Ks}
-        
 
-        print("recall@k calculation started")
         # Micro PR curves/metrics on valid subset
         filtered_rankings = [rankings[i] for i in self.valid_indices]
         filtered_query_ids = np.asarray(self.valid_indices, dtype=np.int64)
-        print("micro curves calculation started")
-        curves = build_micro_curves_from_rankings(filtered_rankings, oracle, query_ids=filtered_query_ids)
+        # curves = build_micro_curves_from_rankings(filtered_rankings, oracle, query_ids=filtered_query_ids)
 
-        # Prepare artifacts (curves and padded fused rankings)
+        # # Prepare artifacts (curves and padded fused rankings)
         curves_dict = {
-            "precision": curves.precision,
-            "recall": curves.recall,
-            "thresholds": curves.thresholds,
-            "f1": curves.f1,
+            "precision": 0,#curves.precision,
+            "recall": 0,#curves.recall,
+            "thresholds": 0,#curves.thresholds,
+            "f1": 0,#curves.f1,
         }
-        print("fused rankings preparation started")
         max_len = max((len(r[0]) for r in rankings), default=0)
         fused_np: tuple[np.ndarray, np.ndarray] | None
         if max_len > 0:
             D = np.full((len(rankings), max_len), np.inf, dtype=np.float32)
             I = np.full((len(rankings), max_len), -1, dtype=np.int64)
+            R = np.full((len(rankings), max_len), False, dtype=bool)
             for i, (d, db) in enumerate(rankings):
                 L = min(len(d), max_len)
                 D[i, :L] = d[:L]
                 I[i, :L] = db[:L]
-            fused_np = (D, I)
+                R[i, :L] = is_pos_all[i][:L]
+            fused_np = (D, I, R)
         else:
             fused_np = None
 
         return BenchmarkArtifacts(
             recall_at_k=recall_at_k,
             recall_at_k_std=recall_at_k_std,
-            auc_pr=curves.auc_pr,
-            f1_max=curves.f1_max,
-            max_recall_at_prec1=curves.max_recall_at_prec1,
+            auc_pr=0,#curves.auc_pr,
+            f1_max=0,#curves.f1_max,
+            max_recall_at_prec1=0,#curves.max_recall_at_prec1,
             num_queries_total=int(len(rankings)),
             num_queries_valid=int(len(self.valid_indices)),
             curves=curves_dict,
@@ -190,11 +210,13 @@ class SequencePRBenchmarker:
                 ),
                 "final_k": int(self.cfg.final_k),
                 "recency_weighting": str(self.cfg.recency_weighting),
+                "similarity_kwargs": self.cfg.similarity_kwargs,
             },
             "recall_at_k": artifacts.recall_at_k,
             "recall_at_k_std": artifacts.recall_at_k_std,
             "auc_pr": artifacts.auc_pr,
             "f1_max": artifacts.f1_max,
+            "sequence_fusion_time_mean_s": self.emulate_sequence_fusion_time_mean_s,
             "max_recall_at_prec1": artifacts.max_recall_at_prec1,
             "num_queries_total": artifacts.num_queries_total,
             "num_queries_valid": artifacts.num_queries_valid,
@@ -210,5 +232,5 @@ class SequencePRBenchmarker:
         )
 
         if artifacts.fused_rankings is not None:
-            D, I = artifacts.fused_rankings
-            np.savez_compressed(str(out_dir / "fused_rankings.npz"), distances=D, db_idx=I)
+            D, I, R = artifacts.fused_rankings
+            np.savez_compressed(str(out_dir / "fused_rankings.npz"), distances=D, db_idx=I, is_pos=R)

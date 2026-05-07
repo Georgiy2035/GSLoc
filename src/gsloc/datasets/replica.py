@@ -65,7 +65,7 @@ def resolve_replica_scene_filter(
 def iter_replica_frames(
     dataset_root: Union[str, Path],
     modality: list[str] = ["image"],
-    graph_dir: str = "SceneGraphs_replica_pt_compact",
+    graph_dir: str = "PT_dir",
 ) -> Iterable[Dict[str, Any]]:
     """Yield frame records for Replica layout: data/<scene>/sequence/frame-*.color.jpg."""
     root = Path(dataset_root)
@@ -103,7 +103,7 @@ def build_replica_df(
     log_every: int = 50_000,
     modality: list[str] = ["image"],
     scene_ids: Optional[Set[str]] = None,
-    graph_dir: str = "SceneGraphs_replica_pt_compact",
+    graph_dir: str = "PT_dir",
 ) -> pd.DataFrame:
     """Build metadata dataframe for Replica, optionally restricted to scene IDs."""
     root = Path(dataset_root)
@@ -225,13 +225,42 @@ class Replica(PRDataset):
         self.graph_edge_attr_dim = graph_edge_attr_dim
         self.graph_rotate = graph_rotate
 
+        self._missing_asset_warn_count = 0
+
         if save_meta:
             self.save_meta_parquet(self.meta_path.parent, meta_file)
 
-    def _load_image(self, image_path: Union[str, Path]) -> Tensor:
-        img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(f"Failed to read image: {image_path}")
+    @staticmethod
+    def _coalesce_storage_path(row: Any, key: str) -> Optional[Path]:
+        """Return a filesystem path from a dataframe row, or None if missing/NaN/empty."""
+        if key not in row.index:
+            return None
+        v = row[key]
+        if v is None:
+            return None
+        try:
+            if pd.isna(v):
+                return None
+        except TypeError:
+            pass
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            return None
+        return Path(s)
+
+    def _warn_missing_asset(self, kind: str, path: Any, exc: Optional[BaseException] = None) -> None:
+        self._missing_asset_warn_count += 1
+        if self._missing_asset_warn_count <= 25:
+            if exc is not None:
+                logger.warning("Missing or unreadable {} {}: {} — {}", kind, path, type(exc).__name__, exc)
+            else:
+                logger.warning("Missing or unreadable {} {}", kind, path)
+        elif self._missing_asset_warn_count == 26:
+            logger.warning("Further missing image/graph file warnings suppressed (first 25 were logged)")
+
+    def _synthetic_image_tensor(self) -> Tensor:
+        """RGB zeros through the same transform path as real images (for missing/corrupt files)."""
+        img = np.zeros((240, 320, 3), dtype=np.uint8)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         if self.image_transform is not None:
             img = self.image_transform(img)
@@ -242,10 +271,49 @@ class Replica(PRDataset):
             img = img.float() / 255.0
         return img
 
-    def _load_graph(self, graph_path: Union[str, Path, None]) -> Any:
+    def _placeholder_graph(self) -> Any:
+        """Single-node empty graph compatible with collate and the graph encoder."""
+        g = _ensure_nonempty(None, self.graph_feat_dim, self.graph_edge_attr_dim)
+        if self.graph_rotate:
+            g = rotate_graph_features(g)
+        return g
+
+    def _load_image(self, image_path: Optional[Union[str, Path]]) -> Tensor:
+        if image_path is None:
+            self._warn_missing_asset("image", "(null path in meta)")
+            return self._synthetic_image_tensor()
+        p = Path(image_path)
+        if not p.is_file():
+            self._warn_missing_asset("image", p)
+            return self._synthetic_image_tensor()
+        img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        if img is None:
+            self._warn_missing_asset("image", p)
+            return self._synthetic_image_tensor()
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.image_transform is not None:
+            img = self.image_transform(img)
+        if not isinstance(img, torch.Tensor):
+            img = torch.from_numpy(np.ascontiguousarray(img))
+            if img.ndim == 3:
+                img = img.permute(2, 0, 1)
+            img = img.float() / 255.0
+        return img
+
+    def _load_graph(self, graph_path: Optional[Union[str, Path]]) -> Any:
         if graph_path is None:
-            return None
-        graph = torch.load(graph_path, map_location="cpu", weights_only=False)
+            self._warn_missing_asset("graph", "(null path in meta)")
+            return self._placeholder_graph()
+        p = Path(graph_path)
+        if not p.is_file():
+            self._warn_missing_asset("graph", p)
+            return self._placeholder_graph()
+        try:
+            graph = torch.load(p, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            self._warn_missing_asset("graph", p, exc)
+            return self._placeholder_graph()
+
         graph = _sanitize_graph_obj(graph, feat_dim=self.graph_feat_dim, feat_edge_attr_dim=self.graph_edge_attr_dim)
 
         if isinstance(graph, list):
@@ -274,9 +342,9 @@ class Replica(PRDataset):
             "pose": pose,
         }
         if "image" in self.modality:
-            frame["image_main"] = self._load_image(row["image_path"])
+            frame["image_main"] = self._load_image(self._coalesce_storage_path(row, "image_path"))
         if "graph" in self.modality:
-            frame["graph_main"] = self._load_graph(row["graph_path"])
+            frame["graph_main"] = self._load_graph(self._coalesce_storage_path(row, "graph_path"))
         return frame
 
     def similarity_check(

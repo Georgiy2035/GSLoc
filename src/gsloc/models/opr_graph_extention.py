@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch, HeteroData
 from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool, global_max_pool
@@ -7,6 +8,8 @@ from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool, global_max_p
 from gsloc.models.graph_encoder import VPRGraphEncoder
 from gsloc.models.graph_encoder import MultiModalVPRGraphEncoder
 from gsloc.models.graph_encoder import GATGraphEncoder
+from gsloc.models.graph_encoder64 import GATGraphEncoder as GATGraphEncoder64
+from gsloc.models.graph_encoder64 import GraphEnhancedMegaloc as GraphEnhancedMegaloc64
 
 class OPR_VPRGraphEncoder(VPRGraphEncoder):
     def __init__(self,
@@ -134,6 +137,71 @@ class OPR_GATGraphEncoder(GATGraphEncoder):
     def out_dim(self):
         return self._proj_dim
 
+class OPR_GATGraphEncoder64(GATGraphEncoder64):
+    def __init__(self,
+                 in_dim,
+                 hidden_dim=256,
+                 n_layers=2,
+                 proj_dim=64,
+                 num_node_classes=None,
+                 node_emb_dim=64,
+                 num_edge_classes=None,
+                 edge_emb_dim=64,
+                 edge_cont_dim=10,
+                 dropout=0.1,
+                 heads=4):
+        super().__init__(
+            in_dim,
+            hidden_dim,
+            n_layers,
+            proj_dim,
+            num_node_classes,
+            node_emb_dim,
+            num_edge_classes,
+            edge_emb_dim,
+            edge_cont_dim,
+            dropout,
+            heads
+        )
+
+    def forward(self, batch):
+        if isinstance(batch, dict):
+            batch = batch["graphs_main"]
+
+        z = super().forward(batch)
+
+        return z
+
+    @property
+    def out_dim(self):
+        return self._proj_dim
+
+class OPR_GraphEnhancedMegaloc64(GraphEnhancedMegaloc64):
+    def __init__(self,
+                 graph_encoder,
+                 image_encoder,
+                 mode="graph"):
+        super().__init__(graph_encoder, image_encoder)
+        self.mode = mode
+        
+    def forward(self, batch, return_parts=True):
+        out = {}
+
+        graph = batch.get("graphs_main", None)
+        image = batch.get("images_main", None)
+
+        out = super().forward(graph=graph, image=image, mode=self.mode, return_parts=return_parts)
+        
+        result = {}
+        # if return_parts:
+        #     result["graph"] = out["graph"]
+        #     result["image"] = out["image"]
+        result["final_descriptor"] = out["fused"] if return_parts else out
+        return result
+
+    @property
+    def out_dim(self):
+        return self._out_dim
 
 
 class EdgeAttrNormalizer:

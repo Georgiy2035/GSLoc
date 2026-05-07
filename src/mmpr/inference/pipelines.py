@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Deque, Literal, Dict
 
 import numpy as np
@@ -212,11 +213,21 @@ class PlaceRecognitionPipeline:
         self.device = parse_device(device)
         self.model = init_model(model, model_weights_path, self.device)
         self.model.eval()
+        # Running mean for index.search(...) latency in seconds.
+        self.index_search_time_mean_s: float = 0.0
+        self._index_search_time_total_s: float = 0.0
+        self._index_search_calls: int = 0
     
 
     def _search_descriptors(self, descriptors: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
         """Run index search for a descriptor batch and map metadata."""
+        t0 = perf_counter()
         inds, dists = self.index.search(descriptors, int(k))
+        dt = perf_counter() - t0
+        self._index_search_calls += 1
+        self._index_search_time_total_s += dt
+        self.index_search_time_mean_s = self._index_search_time_total_s / self._index_search_calls
+        
         db_idx, db_pose, _db_pc = self.index.get_meta(inds.reshape(-1))
         db_idx = db_idx.reshape(inds.shape)
         db_pose = db_pose.reshape(*inds.shape, -1)
@@ -535,25 +546,47 @@ class PlaceRecognitionRerankPipeline:
         self.model2 = init_model(model2, model2_weights_path, self.device)
         self.model1.eval()
         self.model2.eval()
+        # Running mean for index1.search(...) latency in seconds.
+        self.index1_search_time_mean_s: float = 0.0
+        self._index1_search_time_total_s: float = 0.0
+        self._index1_search_calls: int = 0
+        # Running mean for index2.search(...) latency in seconds.
+        self.index2_search_time_mean_s: float = 0.0
+        self._index2_search_time_total_s: float = 0.0
+        self._index2_search_calls: int = 0
     
 
     def _search_descriptors(self, descriptors1: np.ndarray, descriptors2: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
         """Run index search for a descriptor batch and map metadata."""
+        ####FIRST INDEX SEARCH########################################################################################
+        t0 = perf_counter()
         inds, _ = self.index1.search(descriptors1, int(k))
+        dt = perf_counter() - t0
+        self._index1_search_calls += 1
+        self._index1_search_time_total_s += dt
+        self.index1_search_time_mean_s = self._index1_search_time_total_s / self._index1_search_calls
+        
+        ####SECOND INDEX SEARCH########################################################################################
+        t0 = perf_counter()
         dists = self.index2.distances_to_rows(descriptors2, inds)
         order = np.argsort(dists, axis=1)
+        dt = perf_counter() - t0
+        self._index2_search_calls += 1
+        self._index2_search_time_total_s += dt
+        self.index2_search_time_mean_s = self._index2_search_time_total_s / self._index2_search_calls
+        
         inds = np.take_along_axis(inds, order, axis=1)
         dists = np.take_along_axis(dists, order, axis=1)
         
         db_idx, db_pose, _db_pc = self.index2.get_meta(inds.reshape(-1))
         db_idx = db_idx.reshape(inds.shape)
         db_pose = db_pose.reshape(*inds.shape, -1)
-
         results: list[PlaceRecognitionResult] = []
         for row in range(descriptors2.shape[0]):
             results.append(
                 PlaceRecognitionResult(
-                    descriptor=descriptors2[row],
+                    descriptor=descriptors1[row],
+                    descriptor2=descriptors2[row],
                     indices=inds[row].astype(np.int64, copy=False),
                     distances=dists[row].astype(np.float32, copy=False),
                     db_idx=db_idx[row].astype(np.int64, copy=False),

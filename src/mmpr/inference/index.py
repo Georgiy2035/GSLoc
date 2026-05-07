@@ -362,6 +362,7 @@ class FaissFlatIndex(Index):
         """
         self._schema = schema
         self._descriptors = np.ascontiguousarray(descriptors.astype(np.float32, copy=False))
+        self._descriptor_sq_norms = np.sum(self._descriptors * self._descriptors, axis=1, dtype=np.float32)
         self._db_idx = db_idx.astype(np.int64, copy=False)
         self._db_pose = db_pose.astype(np.float32, copy=False)
         # keep as object array to preserve NaN or str values
@@ -514,9 +515,16 @@ class FaissFlatIndex(Index):
             )
         db_vecs = self._descriptors[rows]
         if self._schema.metric == IndexMetric.L2:
-            diff = q[:, np.newaxis, :] - db_vecs
-            return np.sum(diff * diff, axis=-1, dtype=np.float32)
-        ip = np.sum(q[:, np.newaxis, :] * db_vecs, axis=-1, dtype=np.float32)
+            # Faster and more memory-efficient than explicit (q - db_vecs)**2:
+            # ||q-x||^2 = ||q||^2 + ||x||^2 - 2 * <q, x>
+            q_sq = np.sum(q * q, axis=1, dtype=np.float32)[:, np.newaxis]  # [Q, 1]
+
+            db_sq = self._descriptor_sq_norms[rows]  # [Q, K]
+            dot = np.einsum("qd,qkd->qk", q, db_vecs, dtype=np.float32)
+            dists = q_sq + db_sq - (2.0 * dot)
+            # Numerical jitter can produce tiny negatives near zero.
+            return np.maximum(dists, 0.0).astype(np.float32, copy=False)
+        ip = np.einsum("qd,qkd->qk", q, db_vecs, dtype=np.float32)
         return (-ip).astype(np.float32, copy=False)
 
     def size(self) -> int:

@@ -31,6 +31,34 @@ def _extract_embedding(x):
     raise TypeError(f"Unsupported encoder output type: {type(x)}")
 
 
+def _sanitize_graph_edges(edge_index: torch.Tensor, num_nodes: int, edge_attr: torch.Tensor | None = None):
+    """Drop invalid edges to avoid CUDA index-out-of-bounds in PyG convs."""
+    if edge_index is None:
+        return edge_index, edge_attr
+    if edge_index.numel() == 0:
+        return edge_index, edge_attr
+    if edge_index.dim() != 2:
+        return edge_index, None
+    if edge_index.size(0) != 2 and edge_index.size(1) == 2:
+        edge_index = edge_index.t()
+    if edge_index.size(0) != 2:
+        return edge_index, None
+    edge_index = edge_index.long()
+    src = edge_index[0]
+    dst = edge_index[1]
+    valid = (src >= 0) & (dst >= 0) & (src < num_nodes) & (dst < num_nodes)
+    if bool(valid.all()):
+        if edge_attr is not None and edge_attr.size(0) != edge_index.size(1):
+            edge_attr = None
+        return edge_index, edge_attr
+    edge_index = edge_index[:, valid]
+    if edge_attr is not None and edge_attr.size(0) == valid.numel():
+        edge_attr = edge_attr[valid]
+    else:
+        edge_attr = None
+    return edge_index, edge_attr
+
+
 
 class VPRGraphEncoder(nn.Module):
     def __init__(self,
@@ -128,6 +156,7 @@ class VPRGraphEncoder(nn.Module):
 
         if self.use_node_class and hasattr(batch, 'node_class') and batch.node_class is not None:
             node_cls = batch.node_class.long().to(x.device)
+            node_cls = node_cls.clamp(0, self.node_emb.num_embeddings - 1)
             node_emb = self.node_emb(node_cls)
             x = torch.cat([x, node_emb], dim=1)
 
@@ -142,6 +171,7 @@ class VPRGraphEncoder(nn.Module):
 
         if self.use_edge_label and hasattr(batch, 'edge_label') and batch.edge_label is not None:
             edge_label = batch.edge_label.long().to(x.device)
+            edge_label = edge_label.clamp(0, self.edge_emb.num_embeddings - 1)
             edge_lbl = self.edge_emb(edge_label)
             edge_lbl = self.edge_label_proj(edge_lbl)
 
@@ -153,8 +183,9 @@ class VPRGraphEncoder(nn.Module):
             else:
                 edge_attr = edge_lbl
 
+        edge_index, edge_attr = _sanitize_graph_edges(batch.edge_index, h.size(0), edge_attr)
         for conv in self.convs:
-            h = conv(h, batch.edge_index, edge_attr)
+            h = conv(h, edge_index, edge_attr)
             h = self.act(h)
             h = self.drop(h)
 
@@ -273,6 +304,7 @@ class GATGraphEncoder(nn.Module):
 
         if self.use_node_class and hasattr(batch, 'node_class') and batch.node_class is not None:
             node_cls = batch.node_class.long().to(x.device)
+            node_cls = node_cls.clamp(0, self.node_emb.num_embeddings - 1)
             node_emb = self.node_emb(node_cls)
             x = torch.cat([x, node_emb], dim=1)
 
@@ -287,6 +319,7 @@ class GATGraphEncoder(nn.Module):
 
         if self.use_edge_label and hasattr(batch, 'edge_label') and batch.edge_label is not None:
             edge_label = batch.edge_label.long().to(x.device)
+            edge_label = edge_label.clamp(0, self.edge_emb.num_embeddings - 1)
             edge_lbl = self.edge_emb(edge_label)
             edge_lbl = self.edge_label_proj(edge_lbl)
 
@@ -298,12 +331,13 @@ class GATGraphEncoder(nn.Module):
             else:
                 edge_attr = edge_lbl
         
+        edge_index, edge_attr = _sanitize_graph_edges(batch.edge_index, h.size(0), edge_attr)
         attn_debug = None
         for i, conv in enumerate(self.convs):
             if return_attn and i == len(self.convs) - 1:
-                h, attn_debug = conv(h, batch.edge_index, edge_attr, return_attention_weights=True)
+                h, attn_debug = conv(h, edge_index, edge_attr, return_attention_weights=True)
             else:
-                h = conv(h, batch.edge_index, edge_attr)
+                h = conv(h, edge_index, edge_attr)
 
             h = self.act(h)
             h = self.drop(h)

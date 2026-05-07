@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from mmpr.modules.vis_utils import quaternion_angle
+import torch
+from typing import Literal, Dict, Any
 
 import numpy as np
 
@@ -22,6 +24,10 @@ def emulate_sequence_fusion(
     frames: list[PerFramePR],
     cfg: EmulatorConfig,
     scene_data: list[str] | None = None,
+    pose_data: list[np.ndarray] | None = None,
+    seq_similarity_filter_mode: Literal["none", "pose"] = "none",
+    seq_similarity_trans_tol_m: float = 3.0,
+    seq_similarity_rot_tol_deg: float = 60.0,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Emulate SequencePlaceRecognitionPipeline fusion over cached per-frame PR results.
 
@@ -37,6 +43,8 @@ def emulate_sequence_fusion(
     win_d: list[np.ndarray] = []
     win_i: list[np.ndarray] = []
 
+    last_kept_by_scene: Dict[str, Dict[str, Any]] = {}
+
     for i, f in enumerate(frames):
         di = f.distances if per_k_used is None else f.distances[:per_k_used]
         ii = f.indices if per_k_used is None else f.indices[:per_k_used]
@@ -49,6 +57,34 @@ def emulate_sequence_fusion(
                 while len(win_d) > 1:
                     win_d.pop(0)
                     win_i.pop(0)
+
+        #############FILTERING###################
+        if pose_data is not None and seq_similarity_filter_mode != "none":
+            prev = last_kept_by_scene.get(scene_data[i], None)
+            is_similar = False
+            if prev is not None:
+                pose_a = torch.as_tensor(pose_data[i], dtype=torch.float64)
+                pose_b = torch.as_tensor(prev["pose"], dtype=torch.float64)
+                t_a = pose_a[:3]
+                t_b = pose_b[:3]
+                trans_diff = float((t_a - t_b).norm())
+                if trans_diff <= float(seq_similarity_trans_tol_m):
+                    q_a = pose_a[3:].detach().cpu().numpy()
+                    q_b = pose_b[3:].detach().cpu().numpy()
+                    rot_diff_deg = quaternion_angle(q_a, q_b, degrees=True, normalize=True)
+                    is_similar = rot_diff_deg <= float(seq_similarity_rot_tol_deg)
+
+                    if is_similar:
+                        win_d.pop()
+                        win_i.pop()
+
+            if not is_similar:
+                last_kept_by_scene[scene_data[i]] = {
+                    "scene": scene_data[i],
+                    "pose": pose_data[i],
+                }
+
+        #######END OF FILTERING###################
         
         if len(win_d) > max_window:
             win_d.pop(0)
