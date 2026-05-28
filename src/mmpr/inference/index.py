@@ -43,6 +43,11 @@ except Exception as e:
 
 
 def _infer_model_device(model: nn.Module) -> torch.device:
+    if not isinstance(model, nn.Module):
+        raise TypeError(
+            f"Expected nn.Module instance for inference, got {type(model).__name__}. "
+            "Pass a model object (e.g. FoLBase()), not a Python module."
+        )
     try:
         return next(model.parameters()).device
     except StopIteration:
@@ -374,6 +379,7 @@ class FaissFlatIndex(Index):
         else:
             self._index = faiss.IndexFlatL2(d)
         self._index.add(self._descriptors)
+        self.inference_time = 0
 
     @classmethod
     def load(cls, directory: str | Path) -> "FaissFlatIndex":
@@ -411,7 +417,7 @@ class FaissFlatIndex(Index):
         num_workers: int = 4,
         shuffle: bool = False,
         metric: str = "l2", # can be also "ip" - inner product
-        version: Any = 1
+        version: Any = 1,
     ) -> "FaissFlatIndex":
         """Generate index files (descriptors/meta/schema) in directory based on Dataset and model.
 
@@ -467,6 +473,7 @@ class FaissFlatIndex(Index):
         else:
             logger.info("Using existing descriptors.npy")
 
+            
         meta_exists = (Path(directory) / "meta.parquet").exists()
         descriptors_exists = (Path(directory) / "descriptors.npy").exists()
         if not (descriptors_exists and meta_exists):

@@ -217,6 +217,10 @@ class PlaceRecognitionPipeline:
         self.index_search_time_mean_s: float = 0.0
         self._index_search_time_total_s: float = 0.0
         self._index_search_calls: int = 0
+        # Running mean for model.forward(...) latency in seconds.
+        self.extract_time_mean_s: float = 0.0
+        self._extract_time_total_s: float = 0.0
+        self._extract_calls: int = 0
     
 
     def _search_descriptors(self, descriptors: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
@@ -245,17 +249,17 @@ class PlaceRecognitionPipeline:
             )
         return results
 
-    @torch.inference_mode()
-    def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
-        """Run batched descriptor extraction."""
-        model_input = _prepare_model_input_batch(self.device, batch)
-        out = self.model(model_input)
-        return _extract_descriptors(out)
+    # @torch.inference_mode()
+    # def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
+    #     """Run batched descriptor extraction."""
+        
 
     @torch.inference_mode()
     def batch_infer(self, batch: Dict[str, Any], k: int = 5) -> list[PlaceRecognitionResult]:
         """Run batched PR inference and return one result per sample."""
-        descriptors = self.batch_infer_descriptors(batch)
+        model_input = _prepare_model_input_batch(self.device, batch)
+        out = self.model(model_input)
+        descriptors = _extract_descriptors(out)
         return self._search_descriptors(descriptors, k=k)
 
     @torch.inference_mode()
@@ -280,7 +284,14 @@ class PlaceRecognitionPipeline:
                 model_input = _prepare_model_input_batch(self.device, input_data)
             else:
                 model_input = _preprocess_input(self.device, input_data)
+
+            ext_start = perf_counter()
             out = self.model(model_input)
+            ext_end = perf_counter()    
+            self._extract_time_total_s += ext_end - ext_start
+            self._extract_calls += 1
+            self.extract_time_mean_s = self._extract_time_total_s / self._extract_calls
+
         descriptors = _extract_descriptors(out)
         if descriptors.shape[0] != 1:
             raise ValueError("Expected a single descriptor for single-sample inference")
@@ -554,6 +565,15 @@ class PlaceRecognitionRerankPipeline:
         self.index2_search_time_mean_s: float = 0.0
         self._index2_search_time_total_s: float = 0.0
         self._index2_search_calls: int = 0
+
+        self._extract_calls: int = 0
+        # Running mean for model1.forward(...) latency in seconds.
+        self.extract1_time_mean_s: float = 0.0
+        self._extract1_time_total_s: float = 0.0
+        # Running mean for model2.forward(...) latency in seconds.
+        self.extract2_time_mean_s: float = 0.0
+        self._extract2_time_total_s: float = 0.0
+
     
 
     def _search_descriptors(self, descriptors1: np.ndarray, descriptors2: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
@@ -595,18 +615,21 @@ class PlaceRecognitionRerankPipeline:
             )
         return results
 
-    @torch.inference_mode()
-    def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
-        """Run batched descriptor extraction."""
-        model_input = _prepare_model_input_batch(self.device, batch)
-        out1 = self.model1(model_input)
-        out2 = self.model2(model_input)
-        return _extract_descriptors(out1), _extract_descriptors(out2)
+    # @torch.inference_mode()
+    # def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
+    #     """Run batched descriptor extraction."""
+    #     model_input = _prepare_model_input_batch(self.device, batch)
+    #     out1 = self.model1(model_input)
+    #     out2 = self.model2(model_input)
+    #     return _extract_descriptors(out1), _extract_descriptors(out2)
 
     @torch.inference_mode()
     def batch_infer(self, batch: Dict[str, Any], k: int = 5) -> list[PlaceRecognitionResult]:
         """Run batched PR inference and return one result per sample."""
-        descriptors1, descriptors2 = self.batch_infer_descriptors(batch)
+        model_input = _prepare_model_input_batch(self.device, batch)
+        out1 = self.model1(model_input)
+        out2 = self.model2(model_input)
+        descriptors1, descriptors2 = _extract_descriptors(out1), _extract_descriptors(out2)
         return self._search_descriptors(descriptors1, descriptors2, k=k)
 
     @torch.inference_mode()
@@ -631,8 +654,19 @@ class PlaceRecognitionRerankPipeline:
                 model_input = _prepare_model_input_batch(self.device, input_data)
             else:
                 model_input = _preprocess_input(self.device, input_data)
+            ext1_start = perf_counter()
             out1 = self.model1(model_input)
+            ext1_end = perf_counter()
+            ext2_start = perf_counter()
             out2 = self.model2(model_input)
+            ext2_end = perf_counter()
+
+            self._extract_calls += 1
+            self._extract1_time_total_s += ext1_end - ext1_start
+            self._extract2_time_total_s += ext2_end - ext2_start
+            self.extract1_time_mean_s = self._extract1_time_total_s / self._extract_calls
+            self.extract2_time_mean_s = self._extract2_time_total_s / self._extract_calls
+
         descriptors1 = _extract_descriptors(out1)
         descriptors2 = _extract_descriptors(out2)
         if descriptors1.shape[0] != 1 or descriptors2.shape[0] != 1:

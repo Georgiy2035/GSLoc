@@ -47,6 +47,7 @@ class TestConfig:
         "similarity_rot_tol_deg": 90
     })
     scene_list_path: Path | None = None
+    query_list_path: Path | None = None
     room_json_path: Path | None = None
     image_transform_fn: T.Compose | None = None
     graph_path: Path | None = None #graph dir with .pt files in scenes (depends on graph source - GT, FROSS or VLMGD)
@@ -61,6 +62,7 @@ class TestConfig:
     device: str = "cuda"
     num_workers: int = 4
     batch_size: int = 16
+    time_test: bool = False
     
     ########RERANK CONFIG#################
     rerank_k: int = 500 #number of closest frames returned by first model to rerank
@@ -118,8 +120,8 @@ class Test:
             meta_path=cfg.query_cache_path,
             rebuild_meta=False,
             image_transform=cfg.image_transform_fn,
-            scene_filter_mode="same_room_excluding_listed",
-            scene_list_path=cfg.scene_list_path,
+            scene_filter_mode="same_room_excluding_listed" if cfg.query_list_path is None else "listed",
+            scene_list_path=cfg.scene_list_path if cfg.query_list_path is None else cfg.query_list_path,
             room_json_path=cfg.room_json_path,
             graph_feat_dim = cfg.graph_feat_dim,
             graph_edge_attr_dim = cfg.graph_edge_attr_dim,
@@ -157,7 +159,8 @@ class Test:
                 num_workers=cfg.num_workers,
                 query_cache_dir=cfg.query_cache_path,
                 k=cfg.final_k,
-                device=cfg.device
+                device=cfg.device,
+                time_test = cfg.time_test
             )
 
         else:
@@ -191,7 +194,8 @@ class Test:
                 num_workers=cfg.num_workers,
                 query_cache_dir=cfg.rerank_query_cache_path,
                 k=cfg.rerank_k,
-                device=cfg.device
+                device=cfg.device,
+                time_test = cfg.time_test
             )
 
     def run(self):

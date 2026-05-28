@@ -1,6 +1,9 @@
 data/*
 !data/.gitkeep
 
+weights/*
+!weights/.gitkeep
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
