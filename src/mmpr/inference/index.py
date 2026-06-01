@@ -67,15 +67,15 @@ def _move_collated_batch_to_device(batch: Dict[str, Any], device: torch.device) 
     return out
 
 
-def _descriptor_tensor_from_output(out: Any) -> torch.Tensor:
+def _descriptor_tensor_from_output(out: Any, descriptor_key: str = "final_descriptor") -> torch.Tensor:
     if isinstance(out, dict):
-        if "final_descriptor" not in out:
-            raise KeyError("Model output must contain key 'final_descriptor'")
-        fd = out["final_descriptor"]
-        if isinstance(fd, dict) and "final_descriptor" in fd:
-            fd = fd["final_descriptor"]
+        if descriptor_key not in out:
+            raise KeyError(f"Model output must contain key '{descriptor_key}'")
+        fd = out[descriptor_key]
+        if isinstance(fd, dict) and descriptor_key in fd:
+            fd = fd[descriptor_key]
         if not isinstance(fd, torch.Tensor):
-            raise TypeError(f"final_descriptor must be a torch.Tensor, got {type(fd)}")
+            raise TypeError(f"{descriptor_key} must be a torch.Tensor, got {type(fd)}")
         return fd
     if isinstance(out, torch.Tensor):
         return out
@@ -411,6 +411,7 @@ class FaissFlatIndex(Index):
         dataset: Optional[Dataset] = None,
         dataloader: Optional[DataLoader] = None,
         model: Optional[nn.Module] = None,
+        descriptor_key: str = "final_descriptor",
         rebuild_meta: bool = False,
         rebuild_descriptors: bool = False,
         batch_size: int = 16,
@@ -464,7 +465,7 @@ class FaissFlatIndex(Index):
                     for batch in tqdm(dataloader):
                         batch = _move_collated_batch_to_device(batch, device)
                         raw = model(batch)
-                        final_descriptor = _descriptor_tensor_from_output(raw)
+                        final_descriptor = _descriptor_tensor_from_output(raw, descriptor_key)
                         descriptors.append(final_descriptor.detach().cpu().numpy())
                 descriptors = np.concatenate(descriptors, axis=0)
                 

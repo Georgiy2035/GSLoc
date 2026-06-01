@@ -23,6 +23,7 @@ import torch
 from scipy.spatial.transform import Rotation
 from torch import Tensor, nn
 from gsloc.utils.graphs import _collate_graph_objects
+from gsloc.datasets.pr_dataset import PRDataset
 # import MinkowskiEngine as ME
 
 from mmpr.inference.data import (
@@ -171,16 +172,29 @@ def _looks_like_collated_pr_batch(d: Dict[str, Any]) -> bool:
     )
 
 
-def _extract_descriptors(out: dict[str, Tensor]) -> np.ndarray:
+def _extract_descriptors(out: dict[str, Tensor], extract_key: str = "final_descriptor") -> np.ndarray:
         """Normalize model output into a float32 numpy descriptor batch."""
-        if "final_descriptor" not in out:
-            raise KeyError("Model output must contain 'final_descriptor'")
-        desc_t: Tensor = out["final_descriptor"]
+        if extract_key not in out:
+            raise KeyError(f"Model output must contain '{extract_key}'")
+        desc_t: Tensor = out[extract_key]
         if desc_t.ndim == 1:
             desc_t = desc_t[None, :]
+        elif desc_t.ndim == 3 or desc_t.ndim == 4:
+            desc_t = desc_t.flatten(start_dim=1)
         elif desc_t.ndim != 2:
-            raise ValueError("Expected descriptor tensor of shape [D] or [B,D]")
+            raise ValueError(
+                f"Expected descriptor tensor of shape [D], [B,D], or [B,N,H]; got {desc_t.shape}"
+            )
         return desc_t.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _l2_sq_distances(queries: np.ndarray, candidates: np.ndarray) -> np.ndarray:
+    """L2-squared distances from each query to aligned candidate rows (FAISS Flat L2 convention)."""
+    q_sq = np.sum(queries * queries, axis=1, dtype=np.float32)[:, np.newaxis]
+    db_sq = np.sum(candidates * candidates, axis=2, dtype=np.float32)
+    dot = np.einsum("qd,qkd->qk", queries, candidates, dtype=np.float32)
+    dists = q_sq + db_sq - (2.0 * dot)
+    return np.maximum(dists, 0.0).astype(np.float32, copy=False)
 
 # =============================================================================
 # Place Recognition Pipeline
@@ -534,12 +548,12 @@ class PlaceRecognitionRerankPipeline:
 
     def __init__(
         self,
-        index1: Index,
-        index2: Index,
-        model1: nn.Module,
-        model2: nn.Module,
-        model1_weights_path: str | Path | None = None,  
-        model2_weights_path: str | Path | None = None,
+        index: Index,
+        model: nn.Module,
+        model_weights_path: str | Path | None = None,  
+        rerank_index: Index | None = None,    
+        rerank_model: nn.Module | None = None,
+        rerank_model_weights_path: str | Path | None = None,
         device: str | int | torch.device = "cpu",
     ) -> None:
         """Initialize the pipeline.
@@ -550,63 +564,91 @@ class PlaceRecognitionRerankPipeline:
             model_weights_path: Optional path to weights to load.
             device: Torch device spec.
         """
-        self.index1 = index1
-        self.index2 = index2
         self.device = parse_device(device)
-        self.model1 = init_model(model1, model1_weights_path, self.device)
-        self.model2 = init_model(model2, model2_weights_path, self.device)
-        self.model1.eval()
-        self.model2.eval()
-        # Running mean for index1.search(...) latency in seconds.
-        self.index1_search_time_mean_s: float = 0.0
-        self._index1_search_time_total_s: float = 0.0
-        self._index1_search_calls: int = 0
-        # Running mean for index2.search(...) latency in seconds.
-        self.index2_search_time_mean_s: float = 0.0
-        self._index2_search_time_total_s: float = 0.0
-        self._index2_search_calls: int = 0
 
+        self.index = index
+        self.model = init_model(model, model_weights_path, self.device)
+        self.model.eval()
+
+        self.rerank_index = rerank_index
+        self.rerank_model = None
+        if rerank_model is not None:
+            self.rerank_model = init_model(rerank_model, rerank_model_weights_path, self.device)
+            self.rerank_model.eval()
+        
+        # Running mean for index.search(...) latency in seconds.
+        self.index_search_time_mean_s: float = 0.0
+        self._index_search_time_total_s: float = 0.0
+        self._index_search_calls: int = 0
+        # Running mean for rerank_index.search(...) latency in seconds.
+        self.rerank_index_search_time_mean_s: float = 0.0
+        self._rerank_index_search_time_total_s: float = 0.0
+        self._rerank_index_search_calls: int = 0
+        
+        # Running mean for model.forward(...) latency in seconds.
+        self.extract_time_mean_s: float = 0.0
+        self._extract_time_total_s: float = 0.0
+        # Running mean for rerank_model.forward(...) latency in seconds.
+        self.rerank_extract_time_mean_s: float = 0.0
+        self._rerank_extract_time_total_s: float = 0.0
+        # Running calls for model.forward(...) and rerank_model.forward(...)
         self._extract_calls: int = 0
-        # Running mean for model1.forward(...) latency in seconds.
-        self.extract1_time_mean_s: float = 0.0
-        self._extract1_time_total_s: float = 0.0
-        # Running mean for model2.forward(...) latency in seconds.
-        self.extract2_time_mean_s: float = 0.0
-        self._extract2_time_total_s: float = 0.0
+        self._rerank_extract_calls: int = 0
 
-    
+        self.rerank_mode = True # for pr_infer rerank pipeline compatibility
 
-    def _search_descriptors(self, descriptors1: np.ndarray, descriptors2: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
+
+    def _search_descriptors(self, descriptors: np.ndarray, rerank_descriptors: np.ndarray, k: int, dataset: PRDataset | None = None) -> list[PlaceRecognitionResult]:
         """Run index search for a descriptor batch and map metadata."""
         ####FIRST INDEX SEARCH########################################################################################
         t0 = perf_counter()
-        inds, _ = self.index1.search(descriptors1, int(k))
+        inds, _ = self.index.search(descriptors, int(k))
         dt = perf_counter() - t0
-        self._index1_search_calls += 1
-        self._index1_search_time_total_s += dt
-        self.index1_search_time_mean_s = self._index1_search_time_total_s / self._index1_search_calls
+        self._index_search_calls += 1
+        self._index_search_time_total_s += dt
+        self.index_search_time_mean_s = self._index_search_time_total_s / self._index_search_calls
         
         ####SECOND INDEX SEARCH########################################################################################
         t0 = perf_counter()
-        dists = self.index2.distances_to_rows(descriptors2, inds)
-        order = np.argsort(dists, axis=1)
+        if self.rerank_index is not None:
+            dists = self.rerank_index.distances_to_rows(rerank_descriptors, inds) # take distances from rerank index by indices from first index search
+            order = np.argsort(dists, axis=1)
+            inds = np.take_along_axis(inds, order, axis=1) 
+            dists = np.take_along_axis(dists, order, axis=1)
+        else:
+            assert dataset is not None, "dataset is required for rerank mode if rerank_index is not provided"
+            q, k_candidates = inds.shape
+            dists = np.empty((q, k_candidates), dtype=np.float32)
+            for j in range(q):
+                batch = dataset.collate_fn([dataset[int(i)] for i in inds[j]])
+                model_input = _prepare_model_input_batch(self.device, batch)
+                out = self.model(model_input)
+                rerank_descriptors_array = _extract_descriptors(out, extract_key="rerank_descriptor")
+                row_dists = _l2_sq_distances(
+                    rerank_descriptors[j : j + 1],
+                    rerank_descriptors_array[np.newaxis, :, :],
+                )[0]
+                order = np.argsort(row_dists)
+                inds[j] = inds[j][order]
+                dists[j] = row_dists[order]
+
         dt = perf_counter() - t0
-        self._index2_search_calls += 1
-        self._index2_search_time_total_s += dt
-        self.index2_search_time_mean_s = self._index2_search_time_total_s / self._index2_search_calls
+        self._rerank_index_search_calls += 1
+        self._rerank_index_search_time_total_s += dt
+        self.rerank_index_search_time_mean_s = self._rerank_index_search_time_total_s / self._rerank_index_search_calls
         
-        inds = np.take_along_axis(inds, order, axis=1)
-        dists = np.take_along_axis(dists, order, axis=1)
         
-        db_idx, db_pose, _db_pc = self.index2.get_meta(inds.reshape(-1))
+        
+        meta_index = self.rerank_index if self.rerank_index is not None else self.index
+        db_idx, db_pose, _db_pc = meta_index.get_meta(inds.reshape(-1))
         db_idx = db_idx.reshape(inds.shape)
         db_pose = db_pose.reshape(*inds.shape, -1)
         results: list[PlaceRecognitionResult] = []
-        for row in range(descriptors2.shape[0]):
+        for row in range(rerank_descriptors.shape[0]):
             results.append(
                 PlaceRecognitionResult(
-                    descriptor=descriptors1[row],
-                    descriptor2=descriptors2[row],
+                    descriptor=descriptors[row],
+                    rerank_descriptor=rerank_descriptors[row],
                     indices=inds[row].astype(np.int64, copy=False),
                     distances=dists[row].astype(np.float32, copy=False),
                     db_idx=db_idx[row].astype(np.int64, copy=False),
@@ -624,16 +666,21 @@ class PlaceRecognitionRerankPipeline:
     #     return _extract_descriptors(out1), _extract_descriptors(out2)
 
     @torch.inference_mode()
-    def batch_infer(self, batch: Dict[str, Any], k: int = 5) -> list[PlaceRecognitionResult]:
+    def batch_infer(self, batch: Dict[str, Any], k: int = 5, dataset: PRDataset | None = None) -> list[PlaceRecognitionResult]:
         """Run batched PR inference and return one result per sample."""
         model_input = _prepare_model_input_batch(self.device, batch)
-        out1 = self.model1(model_input)
-        out2 = self.model2(model_input)
-        descriptors1, descriptors2 = _extract_descriptors(out1), _extract_descriptors(out2)
-        return self._search_descriptors(descriptors1, descriptors2, k=k)
+        out = self.model(model_input)
+
+        if self.rerank_model is not None:
+            rerank_out = self.rerank_model(model_input)
+            descriptors, rerank_descriptors = _extract_descriptors(out), _extract_descriptors(rerank_out)
+            return self._search_descriptors(descriptors, rerank_descriptors, k=k)
+        else:
+            descriptors, rerank_descriptors = _extract_descriptors(out), _extract_descriptors(out, extract_key="rerank_descriptor")
+            return self._search_descriptors(descriptors, rerank_descriptors, k=k, dataset=dataset)
 
     @torch.inference_mode()
-    def infer(self, input_data: dict[str, Any], k: int = 5) -> PlaceRecognitionResult:
+    def infer(self, input_data: dict[str, Any], k: int = 5, dataset: PRDataset | None = None) -> PlaceRecognitionResult:
         """Run a single-sample inference and top-k search.
 
         Args:
@@ -655,23 +702,28 @@ class PlaceRecognitionRerankPipeline:
             else:
                 model_input = _preprocess_input(self.device, input_data)
             ext1_start = perf_counter()
-            out1 = self.model1(model_input)
+            out = self.model(model_input)
             ext1_end = perf_counter()
+            
             ext2_start = perf_counter()
-            out2 = self.model2(model_input)
+            if self.rerank_model is not None:
+                rerank_out = self.rerank_model(model_input)
             ext2_end = perf_counter()
 
             self._extract_calls += 1
-            self._extract1_time_total_s += ext1_end - ext1_start
-            self._extract2_time_total_s += ext2_end - ext2_start
-            self.extract1_time_mean_s = self._extract1_time_total_s / self._extract_calls
-            self.extract2_time_mean_s = self._extract2_time_total_s / self._extract_calls
+            self._rerank_extract_calls += 1
+            self._extract_time_total_s += ext1_end - ext1_start
+            self._rerank_extract_time_total_s += ext2_end - ext2_start if self.rerank_model is not None else 0
+            self.extract_time_mean_s = self._extract_time_total_s / self._extract_calls
+            self.rerank_extract_time_mean_s = self._rerank_extract_time_total_s / self._extract_calls
 
-        descriptors1 = _extract_descriptors(out1)
-        descriptors2 = _extract_descriptors(out2)
-        if descriptors1.shape[0] != 1 or descriptors2.shape[0] != 1:
+        descriptors = _extract_descriptors(out)
+        rerank_descriptors = _extract_descriptors(rerank_out) if self.rerank_model is not None else _extract_descriptors(out, extract_key="rerank_descriptor")
+        if descriptors.shape[0] != 1 or rerank_descriptors.shape[0] != 1:
             raise ValueError("Expected a single descriptor for single-sample inference")
-        return self._search_descriptors(descriptors1, descriptors2, k=k)[0]
+        return self._search_descriptors(descriptors, rerank_descriptors, k=k, dataset=dataset)[0]
+
+
 # =============================================================================
 # Registration Pipeline
 # =============================================================================

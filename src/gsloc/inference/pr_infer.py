@@ -80,14 +80,12 @@ class PRInferencer:
         query_dataset: PRDataset | None = None,
         batch_size: int = 16,
         num_workers: int = 0,
-        query_cache_dir: Path | None = None,
         k: int = 100,
         device: str | torch.device | None = None,
         time_test: bool = False,
     ) -> None:
         self._batch_size = int(batch_size)
         self._num_workers = int(num_workers)
-        self._query_cache_dir = query_cache_dir
         self._k_default = int(k)
 
         self.pr = pr_pipeline  
@@ -95,7 +93,7 @@ class PRInferencer:
         self.device = parse_device(device) if device is not None else getattr(self.pr, "device", "cpu")
         self.frames: list[PerFramePR] = []
         self.time_test = time_test
-        
+        self.rerank_mode = getattr(self.pr, "rerank_mode", None) is not None
 
     def _query_cache_paths(self, query_cache_dir: Path) -> tuple[Path, Path, Path]:
         query_cache_dir = Path(query_cache_dir)
@@ -146,27 +144,6 @@ class PRInferencer:
                 return descriptors
         assert False, "Descriptors cache is incomplete"
 
-    # def _infer_pr_cache_from_descriptors(
-    #     self, *, descriptors: np.ndarray, start_idx: int, k: int
-    # ) -> list[PerFramePR]:
-    #     """Compute PerFramePR for descriptors[start_idx:] using FAISS only."""
-    #     frames: list[PerFramePR] = []
-    #     N = descriptors.shape[0]
-    #     for i in tqdm(range(start_idx, N, 1), desc="Infer PR cache"):
-    #         d_batch = descriptors[i : min(N, i+1)]
-    #         inds, dists = self.pr.index.search(d_batch, int(k)) 
-    #         db_idx_flat, _db_pose_flat, _db_pc_path_flat = self.pr.index.get_meta(inds.reshape(-1)) 
-    #         db_idx = db_idx_flat.reshape(inds.shape)
-    #         for b in range(inds.shape[0]):
-    #             frames.append(
-    #                 PerFramePR(
-    #                     indices=inds[b].astype(np.int64, copy=False),
-    #                     distances=dists[b].astype(np.float32, copy=False),
-    #                     db_idx=db_idx[b].astype(np.int64, copy=False),
-    #                 )
-    #             )
-    #     return frames
-
     def run(
         self,
         *,
@@ -174,10 +151,13 @@ class PRInferencer:
         rebuild_pr_cache: bool = False,
         rebuild_query_descriptors: bool = False,
         query_cache_dir: Path | None = None,
+        rerank_query_cache_dir: Path | None = None,
+        database_dataset: PRDataset | None = None, # for self-rerank mode
         **kwargs: Any,
     ) -> list[PerFramePR]:
         k_final = int(self._k_default if k is None else k)
-        q_cache_dir = Path(query_cache_dir) or Path(self._query_cache_dir)
+        q_cache_dir = query_cache_dir
+        rq_cache_dir = rerank_query_cache_dir if self.rerank_mode and rerank_query_cache_dir is not None else None
         N = len(self.query_dataset)
 
         if not rebuild_pr_cache and len(self.frames) > 0:
@@ -230,7 +210,7 @@ class PRInferencer:
                 if count > N_test:
                     break
                 start_time = perf_counter()
-                results = time_infer(batch, k=k_final)
+                results = time_infer(batch, k=k_final, dataset=database_dataset)
                 end_time = perf_counter()
                 self.inference_time += end_time - start_time
             self.inference_time /= N_test
@@ -239,21 +219,42 @@ class PRInferencer:
         self.index_search_time_mean_s = self.pr.index_search_time_mean_s
         self.extract_calls = self.pr._extract_calls
         self.index_search_calls = self.pr._index_search_calls
-            
+
+        if self.rerank_mode:
+            self.rerank_extract_time_mean_s = self.pr.rerank_extract_time_mean_s
+            self.rerank_index_search_time_mean_s = self.pr.rerank_index_search_time_mean_s
+            self.rerank_extract_calls = self.pr._rerank_extract_calls
+        else:
+            self.rerank_extract_time_mean_s = 0
+            self.rerank_index_search_time_mean_s = 0
+            self.rerank_extract_calls = 0
 
         #######FULL QUERY DESCRIPTORS AND PR CACHE CALCULATION########################
         # If query descriptors are being rebuilt, we also rebuild pr_cache from scratch.
         need_full_pr_rebuild = rebuild_query_descriptors or q_cache_dir is None or (not q_cache_dir.exists())
-
+        using_unsavable_rerank = self.rerank_mode and self.pr.rerank_index is None
+        need_descriptors_save = q_cache_dir is not None and (not q_cache_dir.exists() or rebuild_query_descriptors)
+        need_rerank_descriptors_save = self.rerank_mode and rq_cache_dir is not None and (not rq_cache_dir.exists() or rebuild_query_descriptors)
+        
         frames_full: list[PerFramePR] = []
-        if need_full_pr_rebuild:
+        if need_full_pr_rebuild or using_unsavable_rerank or need_rerank_descriptors_save:
             desc_parts: list[np.ndarray] = []
+            rerank_desc_parts: list[np.ndarray] = []
             
             for batch in tqdm(loader, desc="Compute descriptors + PR cache"):
-                results = infer(batch, k=k_final)
-                desc_parts.append(
-                    np.stack([result.descriptor for result in results], axis=0).astype(np.float32, copy=False)
-                )
+                
+                results = infer(batch, k=k_final, dataset=database_dataset)
+                
+                if need_descriptors_save:
+                    desc_parts.append(
+                        np.stack([result.descriptor for result in results], axis=0).astype(np.float32, copy=False)
+                    )
+                if need_rerank_descriptors_save:
+                    assert getattr(results[0], "rerank_descriptor", None) is not None, "rerank_descriptor is required"
+                    rerank_desc_parts.append(
+                        np.stack([result.rerank_descriptor for result in results], axis=0).astype(np.float32, copy=False)
+                    )
+
                 for result in results:
                     if result.db_idx is None:
                         raise RuntimeError("PlaceRecognitionPipeline.batch_infer must populate db_idx")
@@ -264,12 +265,17 @@ class PRInferencer:
                             db_idx=result.db_idx,
                         )
                     )
-            descriptors_all = np.concatenate(desc_parts, axis=0)
-            if descriptors_all.shape[0] != N:
-                raise RuntimeError(f"Descriptor row count mismatch: {descriptors_all.shape[0]} != {N}")
 
-            if q_cache_dir is not None:
+            if need_descriptors_save:
+                descriptors_all = np.concatenate(desc_parts, axis=0)          
+                if descriptors_all.shape[0] != N:
+                    raise RuntimeError(f"Descriptor row count mismatch: {descriptors_all.shape[0]} != {N}")
                 self._save_query_cache(q_cache_dir, descriptors=descriptors_all)
+                
+            if need_rerank_descriptors_save:
+                rerank_descriptors_all = np.concatenate(rerank_desc_parts, axis=0)
+                self._save_query_cache(rq_cache_dir, descriptors=rerank_descriptors_all)
+            
             self.frames = frames_full
             return self.frames
 
@@ -279,10 +285,18 @@ class PRInferencer:
         descriptors = self._ensure_query_descriptors_cache(
             query_cache_dir=q_cache_dir
         )
+        rerank_descriptors = None
+        if self.rerank_mode and rq_cache_dir is not None:
+            rerank_descriptors = self._ensure_query_descriptors_cache(
+                query_cache_dir=rq_cache_dir
+            )
+        using_rerank = rerank_descriptors is not None
 
-        print("Descriptors loaded: ", descriptors.shape, "getting results")
-        for descriptor in tqdm(descriptors, desc="retrieval"):
-            results = self.pr._search_descriptors(np.array([descriptor]), k_final)
+        print("Descriptors loaded: ", descriptors.shape, rerank_descriptors.shape, "getting results")
+        iter_d = zip(descriptors, rerank_descriptors) if using_rerank else descriptors
+        for ds in tqdm(iter_d, desc="retrieval"):
+            results = self.pr._search_descriptors(np.array([ds[0]]), np.array([ds[1]]), k_final, dataset=database_dataset) \
+                if using_rerank else self.pr._search_descriptors(np.array([ds]), k_final)
             for result in results:
                 if result.db_idx is None:
                     raise RuntimeError("PlaceRecognitionPipeline.batch_infer must populate db_idx")
@@ -294,6 +308,7 @@ class PRInferencer:
                     )
                 )
         print("Results got: ", len(frames_full))
+
         self.frames = frames_full
         return self.frames
 
@@ -317,8 +332,11 @@ class PRInferencer:
         time_schema = {
             "full_inference_time": self.inference_time,
             "extract_time_mean_s": self.extract_time_mean_s,
+            "rerank_extract_time_mean_s": self.rerank_extract_time_mean_s,
             "extract_time_calls": self.extract_calls,
+            "rerank_extract_time_calls": self.rerank_extract_calls,
             "index_search_time_mean_s": self.index_search_time_mean_s,
+            "rerank_index_search_time_mean_s": self.rerank_index_search_time_mean_s,
             "index_search_time_calls": self.index_search_calls,
         }
         time_path.write_text(json.dumps(time_schema))
@@ -587,220 +605,198 @@ class PRInferencer:
         df.to_parquet(save_dir / "summaryresults.parquet")
         return df
 
-class PRRerankInferencer(PRInferencer):
-    """Run place recognition on a dataset and cache PR results.
+# class PRRerankInferencer(PRInferencer):
+#     """Run place recognition on a dataset and cache PR results.
 
-    This class supports two modes:
-    - legacy mode: pass `cfg` (old notebooks)
-    - cache mode: pass `pr_pipeline` + `query_dataset`
+#     This class supports two modes:
+#     - legacy mode: pass `cfg` (old notebooks)
+#     - cache mode: pass `pr_pipeline` + `query_dataset`
 
-    Cache mode features:
-    - resume/merge `pr_cache.npz` when some frames are already saved
-    - build and reuse `query_cache_dir/descriptors.npy`, `meta.parquet`, `schema.json`
-      so future runs don't re-run the model
-    - uses `batch_infer` when available; otherwise calls `infer` once per sample, passing
-    the same keys as the dataloader batch with tensors sliced as ``tensor[i : i + 1]``
-    """
+#     Cache mode features:
+#     - resume/merge `pr_cache.npz` when some frames are already saved
+#     - build and reuse `query_cache_dir/descriptors.npy`, `meta.parquet`, `schema.json`
+#       so future runs don't re-run the model
+#     - uses `batch_infer` when available; otherwise calls `infer` once per sample, passing
+#     the same keys as the dataloader batch with tensors sliced as ``tensor[i : i + 1]``
+#     """
 
-    def __init__(
-        self,
-        cfg: PRInferConfig | None = None,
-        *,
-        pr_rerank_pipeline: PlaceRecognitionRerankPipeline | None = None,
-        query_dataset: PRDataset | None = None,
-        batch_size: int = 16,
-        num_workers: int = 0,
-        query_cache_dir: Path | None = None,
-        k: int = 100,
-        device: str | torch.device | None = None,
-        time_test: bool = False,
-    ) -> None:
-        super().__init__(
-            cfg, 
-            pr_pipeline=pr_rerank_pipeline, 
-            query_dataset=query_dataset, 
-            batch_size=batch_size, 
-            num_workers=num_workers, 
-            query_cache_dir=query_cache_dir, 
-            k=k, 
-            device=device,
-            time_test=time_test
-        )
-        self.pr = pr_rerank_pipeline
+#     def __init__(
+#         self,
+#         cfg: PRInferConfig | None = None,
+#         *,
+#         pr_rerank_pipeline: PlaceRecognitionRerankPipeline | None = None,
+#         query_dataset: PRDataset | None = None,
+#         batch_size: int = 16,
+#         num_workers: int = 0,
+#         query_cache_dir: Path | None = None,
+#         k: int = 100,
+#         device: str | torch.device | None = None,
+#         time_test: bool = False,
+#     ) -> None:
+#         super().__init__(
+#             cfg, 
+#             pr_pipeline=pr_rerank_pipeline, 
+#             query_dataset=query_dataset, 
+#             batch_size=batch_size, 
+#             num_workers=num_workers, 
+#             query_cache_dir=query_cache_dir, 
+#             k=k, 
+#             device=device,
+#             time_test=time_test
+#         )
+#         self.pr = pr_rerank_pipeline
 
-    def _save_query_cache(self, query_cache_dir: Path, *, descriptors: np.ndarray) -> None:
-        query_cache_dir = Path(query_cache_dir)
-        query_cache_dir.mkdir(parents=True, exist_ok=True)
+    
 
-        desc_path, meta_path, schema_path = self._query_cache_paths(query_cache_dir)
-        np.save(str(desc_path), descriptors.astype(np.float32, copy=False))
-
-        if not hasattr(self.query_dataset, "save_meta_parquet"):
-            raise AttributeError("query_dataset must implement save_meta_parquet(...)")
-        self.query_dataset.save_meta_parquet(query_cache_dir, meta_file="meta.parquet")  
-
-        metric_enum = self.pr.index1.metric() 
-        metric_str = metric_enum.value if hasattr(metric_enum, "value") else str(metric_enum)
-
-        schema = {
-            "version": "1",
-            "number": int(descriptors.shape[0]),
-            "dim": int(descriptors.shape[1]),
-            "metric": metric_str,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "opr_version": getattr(opr_version, "__version__", "") if opr_version is not None else "",
-        }
-        schema_path.write_text(json.dumps(schema))
-
-    def run(
-        self,
-        *,
-        k: Optional[int] = None,
-        rebuild_pr_cache: bool = False,
-        rebuild_query_descriptors: bool = False,
-        query_cache_dir: str | Path | None = None,
-        rerank_query_cache_dir: Path | None = None,
-        **kwargs: Any,
-    ) -> list[PerFramePR]:
-        k_final = int(self._k_default if k is None else k)
-        q_cache_dir = Path(query_cache_dir) or Path(self._query_cache_dir)
-        N = len(self.query_dataset)
-        rq_cache_dir = Path(rerank_query_cache_dir)
+#     def run(
+#         self,
+#         *,
+#         k: Optional[int] = None,
+#         rebuild_pr_cache: bool = False,
+#         rebuild_query_descriptors: bool = False,
+#         query_cache_dir: str | Path | None = None,
+#         rerank_query_cache_dir: Path | None = None,
+#         **kwargs: Any,
+#     ) -> list[PerFramePR]:
+#         k_final = int(self._k_default if k is None else k)
+#         q_cache_dir = Path(query_cache_dir) or Path(self._query_cache_dir)
+#         N = len(self.query_dataset)
+#         rq_cache_dir = Path(rerank_query_cache_dir)
         
-        if not rebuild_pr_cache and len(self.frames) > 0:
-            return self.frames
+#         if not rebuild_pr_cache and len(self.frames) > 0:
+#             return self.frames
 
-        #######INFER FUNC AND LOADER CREATION########################
-        batch_infer = getattr(self.pr, "batch_infer", None)
-        one_sample_infer = getattr(self.pr, "infer", None)
-        if not callable(batch_infer) and not callable(one_sample_infer):
-            raise AttributeError(
-                "`pr` must define `batch_infer` or `infer` for full descriptor + PR rebuild"
-            )
-        # Full pass: use batch_infer to compute both descriptors and PR results.
-        if callable(batch_infer):
-            infer = batch_infer
-            loader = DataLoader(
-                self.query_dataset,
-                batch_size=self._batch_size,
-                shuffle=False,
-                num_workers=self._num_workers,
-                collate_fn=self.query_dataset.collate_fn,
-            )
-        else:
-            assert one_sample_infer is not None
-            infer = one_sample_infer
-            loader = DataLoader(
-                self.query_dataset,
-                batch_size=1,
-                shuffle=False,
-                num_workers=self._num_workers,
-                collate_fn=self.query_dataset.collate_fn,
-            )
+#         #######INFER FUNC AND LOADER CREATION########################
+#         batch_infer = getattr(self.pr, "batch_infer", None)
+#         one_sample_infer = getattr(self.pr, "infer", None)
+#         if not callable(batch_infer) and not callable(one_sample_infer):
+#             raise AttributeError(
+#                 "`pr` must define `batch_infer` or `infer` for full descriptor + PR rebuild"
+#             )
+#         # Full pass: use batch_infer to compute both descriptors and PR results.
+#         if callable(batch_infer):
+#             infer = batch_infer
+#             loader = DataLoader(
+#                 self.query_dataset,
+#                 batch_size=self._batch_size,
+#                 shuffle=False,
+#                 num_workers=self._num_workers,
+#                 collate_fn=self.query_dataset.collate_fn,
+#             )
+#         else:
+#             assert one_sample_infer is not None
+#             infer = one_sample_infer
+#             loader = DataLoader(
+#                 self.query_dataset,
+#                 batch_size=1,
+#                 shuffle=False,
+#                 num_workers=self._num_workers,
+#                 collate_fn=self.query_dataset.collate_fn,
+#             )
 
 
-        #########TIME TEST#################
-        N_test = 100
-        self.inference_time = 0
-        count = 0
+#         #########TIME TEST#################
+#         N_test = 100
+#         self.inference_time = 0
+#         count = 0
 
-        if self.time_test:
-            time_infer = one_sample_infer
-            time_test_dataloader = DataLoader(
-                        self.query_dataset, 
-                        batch_size=1, 
-                        shuffle=True, 
-                        num_workers=self._num_workers, 
-                        collate_fn=self.query_dataset.collate_fn
-                    )
-            for batch in tqdm(time_test_dataloader, desc="Time test", total=N_test):
-                count += 1
-                if count > N_test:
-                    break
-                start_time = perf_counter()
-                results = time_infer(batch, k=k_final)
-                end_time = perf_counter()
-                self.inference_time += end_time - start_time
-            self.inference_time /= N_test
+#         if self.time_test:
+#             time_infer = one_sample_infer
+#             time_test_dataloader = DataLoader(
+#                         self.query_dataset, 
+#                         batch_size=1, 
+#                         shuffle=True, 
+#                         num_workers=self._num_workers, 
+#                         collate_fn=self.query_dataset.collate_fn
+#                     )
+#             for batch in tqdm(time_test_dataloader, desc="Time test", total=N_test):
+#                 count += 1
+#                 if count > N_test:
+#                     break
+#                 start_time = perf_counter()
+#                 results = time_infer(batch, k=k_final)
+#                 end_time = perf_counter()
+#                 self.inference_time += end_time - start_time
+#             self.inference_time /= N_test
 
-        self.extract1_time_mean_s = self.pr.extract1_time_mean_s
-        self.extract2_time_mean_s = self.pr.extract2_time_mean_s
-        self.extract_calls = self.pr._extract_calls
-        self.index1_search_time_mean_s = self.pr.index1_search_time_mean_s
-        self.index2_search_time_mean_s = self.pr.index2_search_time_mean_s
-        self.index1_search_calls = self.pr._index1_search_calls
-        self.index2_search_calls = self.pr._index2_search_calls
+#         self.extract1_time_mean_s = self.pr.extract1_time_mean_s
+#         self.extract2_time_mean_s = self.pr.extract2_time_mean_s
+#         self.extract_calls = self.pr._extract_calls
+#         self.index1_search_time_mean_s = self.pr.index1_search_time_mean_s
+#         self.index2_search_time_mean_s = self.pr.index2_search_time_mean_s
+#         self.index1_search_calls = self.pr._index1_search_calls
+#         self.index2_search_calls = self.pr._index2_search_calls
             
-        #######FULL QUERY DESCRIPTORS AND PR CACHE CALCULATION########################
-        # If query descriptors are being rebuilt, we also rebuild pr_cache from scratch.
-        need_full_pr_rebuild = rebuild_query_descriptors or q_cache_dir is None or (not q_cache_dir.exists())
-        if need_full_pr_rebuild:
-            desc_parts: list[np.ndarray] = []
-            desc_parts2: list[np.ndarray] = []
-            frames_full: list[PerFramePR] = []   
+#         #######FULL QUERY DESCRIPTORS AND PR CACHE CALCULATION########################
+#         # If query descriptors are being rebuilt, we also rebuild pr_cache from scratch.
+#         need_full_pr_rebuild = rebuild_query_descriptors or q_cache_dir is None or (not q_cache_dir.exists())
+#         if need_full_pr_rebuild:
+#             desc_parts: list[np.ndarray] = []
+#             desc_parts2: list[np.ndarray] = []
+#             frames_full: list[PerFramePR] = []   
             
-            for batch in tqdm(loader, desc="Compute descriptors + PR cache"):
-                results = infer(batch, k=k_final)
-                desc_parts.append(np.stack([result.descriptor for result in results], axis=0).astype(np.float32, copy=False))
-                desc_parts2.append(np.stack([result.descriptor2 for result in results], axis=0).astype(np.float32, copy=False))
-                for result in results:
-                    if result.db_idx is None:
-                        raise RuntimeError("PlaceRecognitionPipeline.batch_infer must populate db_idx")
-                    frames_full.append(
-                        PerFramePR(
-                            indices=result.indices,
-                            distances=result.distances,
-                            db_idx=result.db_idx,
-                        )
-                    )
-            descriptors_all = np.concatenate(desc_parts, axis=0)
-            descriptors_all2 = np.concatenate(desc_parts2, axis=0)
-            if descriptors_all.shape[0] != N:
-                raise RuntimeError(f"Descriptor row count mismatch: {descriptors_all.shape[0]} != {N}")
+#             for batch in tqdm(loader, desc="Compute descriptors + PR cache"):
+#                 results = infer(batch, k=k_final)
+#                 desc_parts.append(np.stack([result.descriptor for result in results], axis=0).astype(np.float32, copy=False))
+#                 desc_parts2.append(np.stack([result.descriptor2 for result in results], axis=0).astype(np.float32, copy=False))
+#                 for result in results:
+#                     if result.db_idx is None:
+#                         raise RuntimeError("PlaceRecognitionPipeline.batch_infer must populate db_idx")
+#                     frames_full.append(
+#                         PerFramePR(
+#                             indices=result.indices,
+#                             distances=result.distances,
+#                             db_idx=result.db_idx,
+#                         )
+#                     )
+#             descriptors_all = np.concatenate(desc_parts, axis=0)
+#             descriptors_all2 = np.concatenate(desc_parts2, axis=0)
+#             if descriptors_all.shape[0] != N:
+#                 raise RuntimeError(f"Descriptor row count mismatch: {descriptors_all.shape[0]} != {N}")
 
-            if q_cache_dir is not None:
-                self._save_query_cache(q_cache_dir, descriptors=descriptors_all)    
-                self._save_query_cache(rq_cache_dir, descriptors=descriptors_all2)
-            self.frames = frames_full
-            return self.frames
+#             if q_cache_dir is not None:
+#                 self._save_query_cache(q_cache_dir, descriptors=descriptors_all)    
+#                 self._save_query_cache(rq_cache_dir, descriptors=descriptors_all2)
+#             self.frames = frames_full
+#             return self.frames
 
-        #######USE CACHED DESCRIPTORS########################
-        # Fast path: use cached descriptors.
-        print("Using cached descriptors for query and rerank: loading from ", q_cache_dir, rq_cache_dir)
-        descriptors = self._ensure_query_descriptors_cache(
-            query_cache_dir=q_cache_dir
-        )
-        descriptors2 = self._ensure_query_descriptors_cache(
-            query_cache_dir=rq_cache_dir
-        )
-        frames_full: list[PerFramePR] = []
-        print("Descriptors loaded: ", descriptors.shape, descriptors2.shape, "getting results")
-        for d1, d2 in tqdm(zip(descriptors, descriptors2), desc="retrieval"):
-            results = self.pr._search_descriptors(np.array([d1]), np.array([d2]), k_final)
-            for result in results:
-                if result.db_idx is None:
-                    raise RuntimeError("PlaceRecognitionPipeline.batch_infer must populate db_idx")
-                frames_full.append(
-                    PerFramePR(
-                        indices=result.indices,
-                        distances=result.distances,
-                        db_idx=result.db_idx,
-                    )
-                )
-        print("Results got: ", len(frames_full))
+#         #######USE CACHED DESCRIPTORS########################
+#         # Fast path: use cached descriptors.
+#         print("Using cached descriptors for query and rerank: loading from ", q_cache_dir, rq_cache_dir)
+#         descriptors = self._ensure_query_descriptors_cache(
+#             query_cache_dir=q_cache_dir
+#         )
+#         descriptors2 = self._ensure_query_descriptors_cache(
+#             query_cache_dir=rq_cache_dir
+#         )
+#         frames_full: list[PerFramePR] = []
+#         print("Descriptors loaded: ", descriptors.shape, descriptors2.shape, "getting results")
+#         for d1, d2 in tqdm(zip(descriptors, descriptors2), desc="retrieval"):
+#             results = self.pr._search_descriptors(np.array([d1]), np.array([d2]), k_final)
+#             for result in results:
+#                 if result.db_idx is None:
+#                     raise RuntimeError("PlaceRecognitionPipeline.batch_infer must populate db_idx")
+#                 frames_full.append(
+#                     PerFramePR(
+#                         indices=result.indices,
+#                         distances=result.distances,
+#                         db_idx=result.db_idx,
+#                     )
+#                 )
+#         print("Results got: ", len(frames_full))
 
-        self.frames = frames_full
-        return self.frames
+#         self.frames = frames_full
+#         return self.frames
 
-    def _save_time_data(self, time_path: Path) -> None:
-        time_schema = {
-            "full_inference_time": self.inference_time,
-            "extract1_time_mean_s": self.extract1_time_mean_s,
-            "extract2_time_mean_s": self.extract2_time_mean_s,
-            "extract_time_calls": self.extract_calls,
-            "index1_search_time_mean_s": self.index1_search_time_mean_s,
-            "index2_search_time_mean_s": self.index2_search_time_mean_s,
-            "index1_search_time_calls": self.index1_search_calls,
-            "index2_search_time_calls": self.index2_search_calls,
-        }
-        time_path.write_text(json.dumps(time_schema))
+#     def _save_time_data(self, time_path: Path) -> None:
+#         time_schema = {
+#             "full_inference_time": self.inference_time,
+#             "extract1_time_mean_s": self.extract1_time_mean_s,
+#             "extract2_time_mean_s": self.extract2_time_mean_s,
+#             "extract_time_calls": self.extract_calls,
+#             "index1_search_time_mean_s": self.index1_search_time_mean_s,
+#             "index2_search_time_mean_s": self.index2_search_time_mean_s,
+#             "index1_search_time_calls": self.index1_search_calls,
+#             "index2_search_time_calls": self.index2_search_calls,
+#         }
+#         time_path.write_text(json.dumps(time_schema))

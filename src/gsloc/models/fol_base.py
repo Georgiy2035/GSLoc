@@ -158,8 +158,8 @@ class FoLBase(nn.Module):
             load_fol_checkpoint(self.model, weights, device=device)
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        global_descriptor, *_ = self.model(_images_from_batch(batch), test=True)
-        return {"final_descriptor": global_descriptor}
+        global_descriptor, local_feature, *_ = self.model(_images_from_batch(batch), test=True)
+        return {"final_descriptor": global_descriptor, "rerank_descriptor": local_feature}
 
 
 class FoLBaseRerank(nn.Module):

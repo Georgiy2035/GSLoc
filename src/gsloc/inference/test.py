@@ -19,7 +19,7 @@ from opr.datasets.itlp import ITLPCampus
 #from opr.models.place_recognition import MinkLoc3D
 from mmpr.inference import PlaceRecognitionPipeline, FaissFlatIndex, SequencePlaceRecognitionPipeline, PlaceRecognitionRerankPipeline
 
-from gsloc.inference.pr_infer import PRInferencer, PRRerankInferencer
+from gsloc.inference.pr_infer import PRInferencer
 from gsloc.models import opr_graph_extention as network
 # from opr.pipelines.place_recognition import PlaceRecognitionPipeline
 
@@ -59,6 +59,8 @@ class TestConfig:
     ########MODEL RUN CONFIG#################
     model: nn.Module | None = None
     rerank_model: nn.Module | None = None
+    model_self_rerank_flag: bool = False #if True, the reranking is performed by the same model
+    rerank_descriptor_save_flag: bool = True #if True, the rerank descriptors are saved
     device: str = "cuda"
     num_workers: int = 4
     batch_size: int = 16
@@ -97,7 +99,8 @@ class Test:
         cfg.rerank_query_cache_path = cfg.test_path / "rerank_query_cache" if cfg.rerank_query_cache_path is None else cfg.rerank_query_cache_path
         cfg.bench_report_path = cfg.test_path / "bench_report" if cfg.bench_report_path is None else cfg.bench_report_path  
         cfg.frames_path = cfg.bench_report_path / "frames" if cfg.frames_path is None else cfg.frames_path
-
+        
+        
         self.database_dataset = cfg.dataset_class(
             dataset_root=cfg.dataset_path,
             meta_path=cfg.index_path,
@@ -145,22 +148,42 @@ class Test:
         )
 
 
-        if cfg.rerank_model is None:
-            self.pipeline = PlaceRecognitionPipeline(
+        
+
+        if cfg.model_self_rerank_flag:
+
+            self.rerank_index = None
+            if cfg.rerank_descriptor_save_flag:
+                self.rerank_index = FaissFlatIndex.generate(
+                    directory=cfg.rerank_index_path,
+                    dataset=self.database_dataset,
+                    dataloader=None,
+                    model=cfg.rerank_model,
+                    descriptor_key="rerank_descriptor",
+                    rebuild_meta=False,
+                    rebuild_descriptors=False,
+                    batch_size = cfg.batch_size,
+                    num_workers = cfg.num_workers,
+                    shuffle = False,
+                    metric = "l2", # can be also "ip" - inner product
+                    version = 1
+                )
+
+            self.pipeline = PlaceRecognitionRerankPipeline(
                 index=self.index,
+                rerank_index=self.rerank_index,
                 model=cfg.model,
+                rerank_model=None,
                 device=cfg.device,
             )
 
-            self.inferencer = PRInferencer(
-                pr_pipeline=self.pipeline,
-                query_dataset=self.query_dataset,
-                batch_size=cfg.batch_size,
-                num_workers=cfg.num_workers,
-                query_cache_dir=cfg.query_cache_path,
-                k=cfg.final_k,
-                device=cfg.device,
-                time_test = cfg.time_test
+
+        elif cfg.rerank_model is None:
+
+            self.pipeline = PlaceRecognitionPipeline(
+                index=self.index,
+                model=cfg.model,
+                device=cfg.device
             )
 
         else:
@@ -180,23 +203,23 @@ class Test:
             )
 
             self.pipeline = PlaceRecognitionRerankPipeline(
-                index1=self.index,
-                index2=self.rerank_index,
-                model1=cfg.model,
-                model2=cfg.rerank_model,
+                index=self.index,
+                rerank_index=self.rerank_index,
+                model=cfg.model,
+                rerank_model=cfg.rerank_model,
                 device=cfg.device,
             )
             
-            self.inferencer = PRRerankInferencer(
-                pr_rerank_pipeline=self.pipeline,
+        self.inferencer = PRInferencer(
+                pr_pipeline=self.pipeline,
                 query_dataset=self.query_dataset,
                 batch_size=cfg.batch_size,
                 num_workers=cfg.num_workers,
-                query_cache_dir=cfg.rerank_query_cache_path,
                 k=cfg.rerank_k,
                 device=cfg.device,
                 time_test = cfg.time_test
             )
+
 
     def run(self):
         if self.cfg.frames_path.exists():
@@ -204,8 +227,15 @@ class Test:
             frames = self.inferencer.load(self.cfg.frames_path)
         else:
             print(f"Running inference and saving frames to {self.cfg.frames_path}")
-            frames = self.inferencer.run(query_cache_dir=self.cfg.query_cache_path, rerank_query_cache_dir=self.cfg.rerank_query_cache_path, rebuild_query_descriptors=False)
+            frames = self.inferencer.run(
+                query_cache_dir=self.cfg.query_cache_path, 
+                rerank_query_cache_dir=self.cfg.rerank_query_cache_path, 
+                rebuild_query_descriptors=False,
+                rebuild_pr_cache=False,
+                database_dataset=self.database_dataset,
+            )
             self.inferencer.save(self.cfg.frames_path, frames=frames)
+
         self.inferencer.build_sequence_recall_benchmark_report(
             database_dataset=self.database_dataset, 
             similarity_kwargs=self.cfg.similarity_kwargs,
@@ -219,12 +249,6 @@ class Test:
             recall_at_k=self.cfg.recall_at_k,
             seq_filter_kwargs=self.cfg.seq_filter_kwargs
         )
-        if self.cfg.rerank_model is None:
-            print(f"Index search time mean: {self.pipeline.index_search_time_mean_s}")
-        else:
-            print(f"Index1 search time mean: {self.pipeline.index1_search_time_mean_s}")
-            print(f"Rerank index2 search time mean: {self.pipeline.index2_search_time_mean_s}")
-
 
     def save(self):
         pass

@@ -32,13 +32,13 @@ class PlaceRecognitionResult:
     distances: np.ndarray  # [k] raw distances
     db_idx: np.ndarray | None = None  # [k] dataset ids
     db_pose: np.ndarray | None = None  # [k,7] poses (tx,ty,tz,qx,qy,qz,qw)
-    descriptor2: np.ndarray | None = None  # [D] second descriptor for reranking
+    rerank_descriptor: np.ndarray | None = None  # [D] rerank descriptor
 
     def to_dict(self) -> dict:
         """Convert to a JSON-serializable dictionary."""
         return {
             "descriptor": self.descriptor.tolist(),
-            "descriptor2": self.descriptor2.tolist() if self.descriptor2 is not None else None,
+            "rerank_descriptor": self.rerank_descriptor.tolist() if self.rerank_descriptor is not None else None,
             "indices": self.indices.tolist(),
             "distances": self.distances.tolist(),
             "db_idx": self.db_idx.tolist() if self.db_idx is not None else None,
@@ -50,7 +50,7 @@ class PlaceRecognitionResult:
         """Create instance from a dictionary."""
         return cls(
             descriptor=np.array(data["descriptor"], dtype=np.float32),
-            descriptor2=np.array(data["descriptor2"], dtype=np.float32) if data.get("descriptor2") is not None else None,
+            rerank_descriptor=np.array(data["rerank_descriptor"], dtype=np.float32) if data.get("rerank_descriptor") is not None else None,
             indices=np.array(data["indices"], dtype=np.int64),
             distances=np.array(data["distances"], dtype=np.float32),
             db_idx=np.array(data["db_idx"], dtype=np.int64) if data.get("db_idx") is not None else None,
