@@ -360,7 +360,7 @@ class ThreeRScan(PRDataset):
                 limit=limit,
                 modality=modality,
                 scene_ids=selected_scene_ids,
-                scene_to_room_map=self._get_scene_to_room_map(),
+                scene_to_room_map=self._get_scene_to_room_map(room_json_path=self.room_json_path),
                 graph_path=graph_path,
                 similarity_filter_mode=self.similarity_filter_mode,
                 similarity_trans_tol_m=self.similarity_trans_tol_m,
@@ -378,7 +378,14 @@ class ThreeRScan(PRDataset):
 
         # missing cols checking
         missing_cols = {"idx", "pose", "graph_path", "scene", "image_path"} - set(self.df.columns)
+        if "graph" not in self.modality:
+            missing_cols -= set(["graph_path"])
+        if "image" not in self.modality:
+            missing_cols -= set(["image_path"])
         if missing_cols:
+            print(missing_cols)
+            print(self.df.columns)
+            print(self.modality)
             raise ValueError(f"{self.meta_path} is missing columns: {sorted(missing_cols)}, {self.df.columns}")
         
         self.image_transform = image_transform

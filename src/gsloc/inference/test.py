@@ -55,6 +55,7 @@ class TestConfig:
     graph_feat_dim: int | None = None
     graph_edge_attr_dim: int | None = None
     graph_rotate: bool | None = None
+    modality: tuple[Literal["image"], Literal["graph"]] = ("image", "graph")
 
     ########MODEL RUN CONFIG#################
     model: nn.Module | None = None
@@ -94,9 +95,9 @@ class Test:
         self.cfg = cfg
 
         cfg.index_path = cfg.test_path / "index" if cfg.index_path is None else cfg.index_path
-        cfg.rerank_index_path = cfg.test_path / "rerank_index" if cfg.rerank_index_path is None else cfg.rerank_index_path
-        cfg.query_cache_path = cfg.test_path / "query_cache" if cfg.query_cache_path is None else cfg.query_cache_path
-        cfg.rerank_query_cache_path = cfg.test_path / "rerank_query_cache" if cfg.rerank_query_cache_path is None else cfg.rerank_query_cache_path
+        # cfg.rerank_index_path = cfg.test_path / "rerank_index" if cfg.rerank_index_path is None else cfg.rerank_index_path
+        # cfg.query_cache_path = cfg.test_path / "query_cache" if cfg.query_cache_path is None else cfg.query_cache_path
+        # cfg.rerank_query_cache_path = cfg.test_path / "rerank_query_cache" if cfg.rerank_query_cache_path is None else cfg.rerank_query_cache_path
         cfg.bench_report_path = cfg.test_path / "bench_report" if cfg.bench_report_path is None else cfg.bench_report_path  
         cfg.frames_path = cfg.bench_report_path / "frames" if cfg.frames_path is None else cfg.frames_path
         
@@ -115,6 +116,7 @@ class Test:
             graph_rotate = cfg.graph_rotate,
             graph_path=cfg.graph_path,
             edge_normalizer_path=cfg.edge_normalizer_path,
+            modality=cfg.modality,
             **cfg.filter_kwargs
         )
 
@@ -131,6 +133,7 @@ class Test:
             graph_rotate = cfg.graph_rotate,
             graph_path=cfg.graph_path,
             edge_normalizer_path=cfg.edge_normalizer_path,
+            modality=cfg.modality,
         )
 
         self.index = FaissFlatIndex.generate(
@@ -147,9 +150,6 @@ class Test:
             version = 1
         )
 
-
-        
-
         if cfg.model_self_rerank_flag:
 
             self.rerank_index = None
@@ -158,7 +158,7 @@ class Test:
                     directory=cfg.rerank_index_path,
                     dataset=self.database_dataset,
                     dataloader=None,
-                    model=cfg.rerank_model,
+                    model=cfg.model,
                     descriptor_key="rerank_descriptor",
                     rebuild_meta=False,
                     rebuild_descriptors=False,

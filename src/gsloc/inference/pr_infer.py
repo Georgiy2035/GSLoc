@@ -235,6 +235,13 @@ class PRInferencer:
         using_unsavable_rerank = self.rerank_mode and self.pr.rerank_index is None
         need_descriptors_save = q_cache_dir is not None and (not q_cache_dir.exists() or rebuild_query_descriptors)
         need_rerank_descriptors_save = self.rerank_mode and rq_cache_dir is not None and (not rq_cache_dir.exists() or rebuild_query_descriptors)
+
+        print("q_cache_dir: ", q_cache_dir)
+        print("rq_cache_dir: ", rq_cache_dir)
+        print("need_full_pr_rebuild: ", need_full_pr_rebuild)
+        print("using_unsavable_rerank: ", using_unsavable_rerank)
+        print("need_descriptors_save: ", need_descriptors_save)
+        print("need_rerank_descriptors_save: ", need_rerank_descriptors_save)
         
         frames_full: list[PerFramePR] = []
         if need_full_pr_rebuild or using_unsavable_rerank or need_rerank_descriptors_save:
