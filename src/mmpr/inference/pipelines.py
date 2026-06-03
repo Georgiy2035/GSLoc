@@ -269,7 +269,7 @@ class PlaceRecognitionPipeline:
         
 
     @torch.inference_mode()
-    def batch_infer(self, batch: Dict[str, Any], k: int = 5) -> list[PlaceRecognitionResult]:
+    def batch_infer(self, batch: Dict[str, Any], k: int = 5, **kwargs: Any) -> list[PlaceRecognitionResult]:
         """Run batched PR inference and return one result per sample."""
         model_input = _prepare_model_input_batch(self.device, batch)
         out = self.model(model_input)
@@ -277,7 +277,7 @@ class PlaceRecognitionPipeline:
         return self._search_descriptors(descriptors, k=k)
 
     @torch.inference_mode()
-    def infer(self, input_data: dict[str, Any], k: int = 5) -> PlaceRecognitionResult:
+    def infer(self, input_data: dict[str, Any], k: int = 5, **kwargs: Any) -> PlaceRecognitionResult:
         """Run a single-sample inference and top-k search.
 
         Args:

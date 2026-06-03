@@ -157,7 +157,7 @@ class PRInferencer:
     ) -> list[PerFramePR]:
         k_final = int(self._k_default if k is None else k)
         q_cache_dir = query_cache_dir
-        rq_cache_dir = rerank_query_cache_dir if self.rerank_mode and rerank_query_cache_dir is not None else None
+        rq_cache_dir = Path(rerank_query_cache_dir) if self.rerank_mode and rerank_query_cache_dir is not None else None
         N = len(self.query_dataset)
 
         if not rebuild_pr_cache and len(self.frames) > 0:
