@@ -22,6 +22,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Any, Dict, Optional
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from loguru import logger
+import opr
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -32,6 +40,46 @@ except Exception as e:
     raise ImportError(
         "FAISS is required for FaissFlatIndex. Please install faiss-cpu or faiss-gpu."
     ) from e
+
+
+def _infer_model_device(model: nn.Module) -> torch.device:
+    if not isinstance(model, nn.Module):
+        raise TypeError(
+            f"Expected nn.Module instance for inference, got {type(model).__name__}. "
+            "Pass a model object (e.g. FoLBase()), not a Python module."
+        )
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _move_collated_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    non_blocking = device.type == "cuda"
+    for k, v in batch.items():
+        if v is None:
+            out[k] = None
+        elif hasattr(v, "to"):
+            out[k] = v.to(device, non_blocking=non_blocking)
+        else:
+            out[k] = v
+    return out
+
+
+def _descriptor_tensor_from_output(out: Any, descriptor_key: str = "final_descriptor") -> torch.Tensor:
+    if isinstance(out, dict):
+        if descriptor_key not in out:
+            raise KeyError(f"Model output must contain key '{descriptor_key}'")
+        fd = out[descriptor_key]
+        if isinstance(fd, dict) and descriptor_key in fd:
+            fd = fd[descriptor_key]
+        if not isinstance(fd, torch.Tensor):
+            raise TypeError(f"{descriptor_key} must be a torch.Tensor, got {type(fd)}")
+        return fd
+    if isinstance(out, torch.Tensor):
+        return out
+    raise TypeError(f"Unexpected model output type: {type(out)}")
 
 
 # =============================================================================
@@ -112,6 +160,18 @@ class Index(ABC):
                 - `db_pointcloud_path` is object array of shape [M] with each
                   element being a relative path string like "scans/000227.pcd"
                   or "scans/000227.bin", or `numpy.nan` when not available.
+        """
+
+    @abstractmethod
+    def distances_to_rows(self, queries: np.ndarray, row_positions: np.ndarray) -> np.ndarray:
+        """Raw distances from each query to database rows (same convention as ``search``).
+
+        Args:
+            queries: float32 [Q, D].
+            row_positions: int64 [Q, K] internal row ids (0..N-1).
+
+        Returns:
+            float32 [Q, K] distances aligned with ``row_positions``.
         """
 
 
@@ -307,6 +367,7 @@ class FaissFlatIndex(Index):
         """
         self._schema = schema
         self._descriptors = np.ascontiguousarray(descriptors.astype(np.float32, copy=False))
+        self._descriptor_sq_norms = np.sum(self._descriptors * self._descriptors, axis=1, dtype=np.float32)
         self._db_idx = db_idx.astype(np.int64, copy=False)
         self._db_pose = db_pose.astype(np.float32, copy=False)
         # keep as object array to preserve NaN or str values
@@ -318,6 +379,7 @@ class FaissFlatIndex(Index):
         else:
             self._index = faiss.IndexFlatL2(d)
         self._index.add(self._descriptors)
+        self.inference_time = 0
 
     @classmethod
     def load(cls, directory: str | Path) -> "FaissFlatIndex":
@@ -342,6 +404,97 @@ class FaissFlatIndex(Index):
             schema=schema,
         )
 
+    @classmethod
+    def generate(
+        cls,
+        directory: str | Path,
+        dataset: Optional[Dataset] = None,
+        dataloader: Optional[DataLoader] = None,
+        model: Optional[nn.Module] = None,
+        descriptor_key: str = "final_descriptor",
+        rebuild_meta: bool = False,
+        rebuild_descriptors: bool = False,
+        batch_size: int = 16,
+        num_workers: int = 4,
+        shuffle: bool = False,
+        metric: str = "l2", # can be also "ip" - inner product
+        version: Any = 1,
+    ) -> "FaissFlatIndex":
+        """Generate index files (descriptors/meta/schema) in directory based on Dataset and model.
+
+        Args:
+            directory: Path where files `descriptors.npy`, `meta.parquet`, `schema.json` are need to be created.
+            dataset: object of class that is based on torch Dataset and contains "save_meta_parquet" and "collate_fn" functions that parse dataset.
+            dataloader: 
+
+        Returns:
+            FaissFlatIndex: Loaded index ready for search.
+        """
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+        meta_exists = (Path(directory) / "meta.parquet").exists()
+        descriptors_exists = (Path(directory) / "descriptors.npy").exists()
+        rebuild_meta_needed = not meta_exists or rebuild_meta
+        rebuild_descriptors_needed = not descriptors_exists or rebuild_descriptors
+        
+        if dataset is None and rebuild_meta_needed:
+            logger.info("Can't build meta.parquet file. Have no dataset object")
+        elif rebuild_meta_needed:
+            dataset.save_meta_parquet(directory, "meta.parquet")
+            logger.info(f"meta.parquet file was saved in {directory}")
+        else:
+            logger.info("Using existing meta.parquet")
+        
+        if rebuild_descriptors_needed:
+            if model is None:
+                logger.info("Can't build descriptors.npy file. Have no model")
+            elif dataloader is None and dataset is None:
+                logger.info("Can't build descriptors.npy file. Have no dataset or dataloader object")
+            else:
+                if dataloader is None:
+                    dataloader = DataLoader(
+                        dataset, 
+                        batch_size=batch_size, 
+                        shuffle=shuffle, 
+                        num_workers=num_workers, 
+                        collate_fn=dataset.collate_fn
+                    )
+                descriptors = []
+                device = _infer_model_device(model)
+                with torch.no_grad():
+                    for batch in tqdm(dataloader):
+                        batch = _move_collated_batch_to_device(batch, device)
+                        raw = model(batch)
+                        final_descriptor = _descriptor_tensor_from_output(raw, descriptor_key)
+                        descriptors.append(final_descriptor.detach().cpu().numpy())
+                descriptors = np.concatenate(descriptors, axis=0)
+                
+                np.save(f"{directory}/descriptors.npy", descriptors)
+                logger.info(f"descriptors.npy file was saved in {directory}")
+        else:
+            logger.info("Using existing descriptors.npy")
+
+            
+        meta_exists = (Path(directory) / "meta.parquet").exists()
+        descriptors_exists = (Path(directory) / "descriptors.npy").exists()
+        if not (descriptors_exists and meta_exists):
+            logger.info("Can't build schema.json file. Have no descriptors or meta files")
+        else:
+            descriptors = np.load(Path(directory) / "descriptors.npy")
+            N, D = descriptors.shape
+            schema = {
+                "version": str(version),
+                "number": N,
+                "dim": D, 
+                "metric": metric, 
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                "opr_version": opr.__version__}
+
+            Path(f"{directory}/schema.json").write_text(json.dumps(schema))
+            logger.info(f"schema.json file was saved in {directory}")
+
+        return cls.load(directory)
+
     def search(self, queries: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         """Search top-k nearest neighbors.
 
@@ -357,6 +510,30 @@ class FaissFlatIndex(Index):
         q = np.ascontiguousarray(queries.astype(np.float32, copy=False))
         distances, inds = self._index.search(q, k)
         return inds.astype(np.int64, copy=False), distances.astype(np.float32, copy=False)
+
+    def distances_to_rows(self, queries: np.ndarray, row_positions: np.ndarray) -> np.ndarray:
+        """Pairwise distances matching FAISS Flat (L2 squared, or negated IP)."""
+        q = np.ascontiguousarray(queries.astype(np.float32, copy=False))
+        rows = row_positions.astype(np.int64, copy=False)
+        if q.ndim != 2 or rows.ndim != 2:
+            raise ValueError(f"Expected queries [Q,D] and row_positions [Q,K]; got {q.shape}, {rows.shape}")
+        if q.shape[0] != rows.shape[0]:
+            raise ValueError(
+                f"Batch mismatch: queries Q={q.shape[0]} vs row_positions Q={rows.shape[0]}"
+            )
+        db_vecs = self._descriptors[rows]
+        if self._schema.metric == IndexMetric.L2:
+            # Faster and more memory-efficient than explicit (q - db_vecs)**2:
+            # ||q-x||^2 = ||q||^2 + ||x||^2 - 2 * <q, x>
+            q_sq = np.sum(q * q, axis=1, dtype=np.float32)[:, np.newaxis]  # [Q, 1]
+
+            db_sq = self._descriptor_sq_norms[rows]  # [Q, K]
+            dot = np.einsum("qd,qkd->qk", q, db_vecs, dtype=np.float32)
+            dists = q_sq + db_sq - (2.0 * dot)
+            # Numerical jitter can produce tiny negatives near zero.
+            return np.maximum(dists, 0.0).astype(np.float32, copy=False)
+        ip = np.einsum("qd,qkd->qk", q, db_vecs, dtype=np.float32)
+        return (-ip).astype(np.float32, copy=False)
 
     def size(self) -> int:
         """Return number of database items (N)."""

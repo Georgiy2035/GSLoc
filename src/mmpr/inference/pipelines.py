@@ -14,13 +14,17 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
-from typing import Deque, Literal
+from time import perf_counter
+from typing import Any, Deque, Literal, Dict
 
 import numpy as np
 import open3d as o3d
 import torch
 from scipy.spatial.transform import Rotation
 from torch import Tensor, nn
+from gsloc.utils.graphs import _collate_graph_objects
+from gsloc.datasets.pr_dataset import PRDataset
+# import MinkowskiEngine as ME
 
 from mmpr.inference.data import (
     LocalizationResult,
@@ -103,6 +107,95 @@ def _matrix_to_pose7(T: np.ndarray) -> np.ndarray:
     return np.concatenate([t, q]).astype(np.float64, copy=False)
 
 
+def _preprocess_input(device: torch.device, input_data: Dict[str, Tensor], **kwargs) -> Dict[str, Tensor]:
+        """Preprocess input data."""
+        out_dict: Dict[str, Tensor] = {}
+        print(input_data)
+        for key in input_data:
+            if key.startswith("image_"):
+                print(key)
+                out_dict[f"images_{key[6:]}"] = input_data[key].unsqueeze(0).to(device)
+            elif key.startswith("mask_"):
+                print(key)
+                out_dict[f"masks_{key[5:]}"] = input_data[key].unsqueeze(0).to(device)
+            elif key.startswith("graph_"):
+                print(key)
+                out_dict[f"graphs_{key[6:]}"] = _collate_graph_objects(
+                    [input_data[key]], feat_dim=4, feat_edge_attr_dim=7
+                ).to(device, non_blocking=True)
+            elif key == "pointcloud_lidar_coords":
+                quantized_coords, quantized_feats = ME.utils.sparse_quantize(
+                    coordinates=input_data["pointcloud_lidar_coords"],
+                    features=input_data["pointcloud_lidar_feats"],
+                    quantization_size=kwargs.get("pointcloud_quantization_size", 0.5),
+                )
+                out_dict["pointclouds_lidar_coords"] = ME.utils.batched_coordinates([quantized_coords]).to(
+                    device
+                )
+                out_dict["pointclouds_lidar_feats"] = quantized_feats.to(device)
+            elif key == "soc":
+                out_dict["soc"] = input_data[key].unsqueeze(0).to(device)
+        print(out_dict)
+        return out_dict
+
+
+def _prepare_model_input_batch(device: torch.device, batch: Dict[str, Any]) -> Dict[str, Tensor]:
+        """Create model input dict from a collated batch."""
+        model_input: Dict[str, Tensor] = {}
+        for key, value in batch.items():
+            if key.startswith("images_"):
+                model_input[f"images_{key[7:]}"] = value.to(device, non_blocking=True)
+            elif key.startswith("masks_"):
+                model_input[f"masks_{key[6:]}"] = value.to(device, non_blocking=True)
+            elif key.startswith("graphs_"):
+                model_input[f"graphs_{key[7:]}"] = value.to(device, non_blocking=True)
+            elif key == "soc":
+                model_input[key] = value.to(device, non_blocking=True)
+            elif key in {"pointcloud_lidar_coords", "pointcloud_lidar_feats"}:
+                raise NotImplementedError(
+                    "Batched pointcloud preprocessing requires MinkowskiEngine. "
+                    "Use an image-only dataset or implement batched sparse quantization."
+                )
+
+        if not model_input:
+            raise KeyError(
+                "No usable tensor inputs found in batch. Expected at least one tensor key starting with `images_` or `graphs_`."
+            )
+        return model_input
+
+
+def _looks_like_collated_pr_batch(d: Dict[str, Any]) -> bool:
+    """True if ``d`` uses DataLoader-style keys (``images_*``, ``graphs_*``, …)."""
+    return any(
+        k.startswith("images_") or k.startswith("graphs_") or k.startswith("masks_")
+        for k in d
+    )
+
+
+def _extract_descriptors(out: dict[str, Tensor], extract_key: str = "final_descriptor") -> np.ndarray:
+        """Normalize model output into a float32 numpy descriptor batch."""
+        if extract_key not in out:
+            raise KeyError(f"Model output must contain '{extract_key}'")
+        desc_t: Tensor = out[extract_key]
+        if desc_t.ndim == 1:
+            desc_t = desc_t[None, :]
+        elif desc_t.ndim == 3 or desc_t.ndim == 4:
+            desc_t = desc_t.flatten(start_dim=1)
+        elif desc_t.ndim != 2:
+            raise ValueError(
+                f"Expected descriptor tensor of shape [D], [B,D], or [B,N,H]; got {desc_t.shape}"
+            )
+        return desc_t.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _l2_sq_distances(queries: np.ndarray, candidates: np.ndarray) -> np.ndarray:
+    """L2-squared distances from each query to aligned candidate rows (FAISS Flat L2 convention)."""
+    q_sq = np.sum(queries * queries, axis=1, dtype=np.float32)[:, np.newaxis]
+    db_sq = np.sum(candidates * candidates, axis=2, dtype=np.float32)
+    dot = np.einsum("qd,qkd->qk", queries, candidates, dtype=np.float32)
+    dists = q_sq + db_sq - (2.0 * dot)
+    return np.maximum(dists, 0.0).astype(np.float32, copy=False)
+
 # =============================================================================
 # Place Recognition Pipeline
 # =============================================================================
@@ -134,13 +227,63 @@ class PlaceRecognitionPipeline:
         self.device = parse_device(device)
         self.model = init_model(model, model_weights_path, self.device)
         self.model.eval()
+        # Running mean for index.search(...) latency in seconds.
+        self.index_search_time_mean_s: float = 0.0
+        self._index_search_time_total_s: float = 0.0
+        self._index_search_calls: int = 0
+        # Running mean for model.forward(...) latency in seconds.
+        self.extract_time_mean_s: float = 0.0
+        self._extract_time_total_s: float = 0.0
+        self._extract_calls: int = 0
+    
+
+    def _search_descriptors(self, descriptors: np.ndarray, k: int) -> list[PlaceRecognitionResult]:
+        """Run index search for a descriptor batch and map metadata."""
+        t0 = perf_counter()
+        inds, dists = self.index.search(descriptors, int(k))
+        dt = perf_counter() - t0
+        self._index_search_calls += 1
+        self._index_search_time_total_s += dt
+        self.index_search_time_mean_s = self._index_search_time_total_s / self._index_search_calls
+        
+        db_idx, db_pose, _db_pc = self.index.get_meta(inds.reshape(-1))
+        db_idx = db_idx.reshape(inds.shape)
+        db_pose = db_pose.reshape(*inds.shape, -1)
+
+        results: list[PlaceRecognitionResult] = []
+        for row in range(descriptors.shape[0]):
+            results.append(
+                PlaceRecognitionResult(
+                    descriptor=descriptors[row],
+                    indices=inds[row].astype(np.int64, copy=False),
+                    distances=dists[row].astype(np.float32, copy=False),
+                    db_idx=db_idx[row].astype(np.int64, copy=False),
+                    db_pose=db_pose[row].astype(np.float32, copy=False),
+                )
+            )
+        return results
+
+    # @torch.inference_mode()
+    # def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
+    #     """Run batched descriptor extraction."""
+        
 
     @torch.inference_mode()
-    def infer(self, input_data: dict[str, Tensor], k: int = 5) -> PlaceRecognitionResult:
+    def batch_infer(self, batch: Dict[str, Any], k: int = 5, **kwargs: Any) -> list[PlaceRecognitionResult]:
+        """Run batched PR inference and return one result per sample."""
+        model_input = _prepare_model_input_batch(self.device, batch)
+        out = self.model(model_input)
+        descriptors = _extract_descriptors(out)
+        return self._search_descriptors(descriptors, k=k)
+
+    @torch.inference_mode()
+    def infer(self, input_data: dict[str, Any], k: int = 5, **kwargs: Any) -> PlaceRecognitionResult:
         """Run a single-sample inference and top-k search.
 
         Args:
-            input_data: Dict of tensors expected by the model forward.
+            input_data: Legacy keys ``image_*`` / ``graph_*`` (unbatched tensors), or collated
+                keys ``images_*`` / ``graphs_*`` with batch dimension 1 (same layout as
+                ``batch_infer``).
             k: Number of neighbors to retrieve.
 
         Returns:
@@ -150,31 +293,23 @@ class PlaceRecognitionPipeline:
             KeyError: If model output does not contain the `final_descriptor` key.
             ValueError: If the produced descriptor has an unexpected shape.
         """
-        # Forward pass
-        out = self.model(input_data)
-        if "final_descriptor" not in out:
-            raise KeyError("Model output must contain 'final_descriptor'")
-        desc_t: Tensor = out["final_descriptor"]
-        if desc_t.ndim == 2 and desc_t.shape[0] == 1:
-            desc = desc_t[0].detach().cpu().numpy().astype(np.float32, copy=False)
-        elif desc_t.ndim == 1:
-            desc = desc_t.detach().cpu().numpy().astype(np.float32, copy=False)
-        else:
-            raise ValueError("Expected descriptor of shape [D] or [1,D]")
+        with torch.no_grad():
+            if _looks_like_collated_pr_batch(input_data):
+                model_input = _prepare_model_input_batch(self.device, input_data)
+            else:
+                model_input = _preprocess_input(self.device, input_data)
 
-        # Search
-        inds, dists = self.index.search(desc.reshape(1, -1), k)
-        inds = inds[0]
-        dists = dists[0]
-        db_idx, db_pose, _db_pc = self.index.get_meta(inds)
+            ext_start = perf_counter()
+            out = self.model(model_input)
+            ext_end = perf_counter()    
+            self._extract_time_total_s += ext_end - ext_start
+            self._extract_calls += 1
+            self.extract_time_mean_s = self._extract_time_total_s / self._extract_calls
 
-        return PlaceRecognitionResult(
-            descriptor=desc,
-            indices=inds,
-            distances=dists,
-            db_idx=db_idx,
-            db_pose=db_pose,
-        )
+        descriptors = _extract_descriptors(out)
+        if descriptors.shape[0] != 1:
+            raise ValueError("Expected a single descriptor for single-sample inference")
+        return self._search_descriptors(descriptors, k=k)[0]
 
 
 # =============================================================================
@@ -269,7 +404,12 @@ class SequencePlaceRecognitionPipeline:
         final_k = int(k) if k is not None else self.final_k
 
         # 1) Forward pass: single-frame descriptor
-        out = self.model(input_frame)
+        with torch.no_grad():
+            if _looks_like_collated_pr_batch(input_frame):
+                model_input = _prepare_model_input_batch(self.device, input_frame)
+            else:
+                model_input = _preprocess_input(self.device, input_frame)
+            out = self.model(model_input)
         if "final_descriptor" not in out:
             raise KeyError("Model output must contain 'final_descriptor'")
         desc_t: Tensor = out["final_descriptor"]
@@ -343,7 +483,7 @@ class SequencePlaceRecognitionPipeline:
         )
 
         if not return_debug:
-            return fused_res
+            return [fused_res]
 
         debug = SequencePRDebug(
             per_frame_indices=per_i,
@@ -353,7 +493,7 @@ class SequencePlaceRecognitionPipeline:
             window_size=len(self._records),
             descriptor_agg=self.descriptor_agg,
         )
-        return fused_res, debug
+        return [fused_res], debug
 
     # --- internal helpers ---
 
@@ -395,6 +535,193 @@ class SequencePlaceRecognitionPipeline:
         if self._running_sum_descriptor is None:
             return self._records[-1].descriptor.astype(np.float32, copy=False)
         return (self._running_sum_descriptor / count).astype(np.float32, copy=False)
+
+
+
+class PlaceRecognitionRerankPipeline:
+    """Minimal top-k Place Recognition pipeline using an `Index1` with `Index2` as reranker.
+
+    The pipeline assumes that the model returns a dict with key `final_descriptor`.
+    It returns raw FAISS distances with corresponding dataset indices and poses.
+    Index2 is used to rerank the results from Index1.
+    """
+
+    def __init__(
+        self,
+        index: Index,
+        model: nn.Module,
+        model_weights_path: str | Path | None = None,  
+        rerank_index: Index | None = None,    
+        rerank_model: nn.Module | None = None,
+        rerank_model_weights_path: str | Path | None = None,
+        device: str | int | torch.device = "cpu",
+    ) -> None:
+        """Initialize the pipeline.
+
+        Args:
+            index: Loaded `Index` instance.
+            model: PyTorch model that outputs `{"final_descriptor": Tensor[B,D]}`.
+            model_weights_path: Optional path to weights to load.
+            device: Torch device spec.
+        """
+        self.device = parse_device(device)
+
+        self.index = index
+        self.model = init_model(model, model_weights_path, self.device)
+        self.model.eval()
+
+        self.rerank_index = rerank_index
+        self.rerank_model = None
+        if rerank_model is not None:
+            self.rerank_model = init_model(rerank_model, rerank_model_weights_path, self.device)
+            self.rerank_model.eval()
+        
+        # Running mean for index.search(...) latency in seconds.
+        self.index_search_time_mean_s: float = 0.0
+        self._index_search_time_total_s: float = 0.0
+        self._index_search_calls: int = 0
+        # Running mean for rerank_index.search(...) latency in seconds.
+        self.rerank_index_search_time_mean_s: float = 0.0
+        self._rerank_index_search_time_total_s: float = 0.0
+        self._rerank_index_search_calls: int = 0
+        
+        # Running mean for model.forward(...) latency in seconds.
+        self.extract_time_mean_s: float = 0.0
+        self._extract_time_total_s: float = 0.0
+        # Running mean for rerank_model.forward(...) latency in seconds.
+        self.rerank_extract_time_mean_s: float = 0.0
+        self._rerank_extract_time_total_s: float = 0.0
+        # Running calls for model.forward(...) and rerank_model.forward(...)
+        self._extract_calls: int = 0
+        self._rerank_extract_calls: int = 0
+
+        self.rerank_mode = True # for pr_infer rerank pipeline compatibility
+
+
+    def _search_descriptors(self, descriptors: np.ndarray, rerank_descriptors: np.ndarray, k: int, dataset: PRDataset | None = None) -> list[PlaceRecognitionResult]:
+        """Run index search for a descriptor batch and map metadata."""
+        ####FIRST INDEX SEARCH########################################################################################
+        t0 = perf_counter()
+        inds, _ = self.index.search(descriptors, int(k))
+        dt = perf_counter() - t0
+        self._index_search_calls += 1
+        self._index_search_time_total_s += dt
+        self.index_search_time_mean_s = self._index_search_time_total_s / self._index_search_calls
+        
+        ####SECOND INDEX SEARCH########################################################################################
+        t0 = perf_counter()
+        if self.rerank_index is not None:
+            dists = self.rerank_index.distances_to_rows(rerank_descriptors, inds) # take distances from rerank index by indices from first index search
+            order = np.argsort(dists, axis=1)
+            inds = np.take_along_axis(inds, order, axis=1) 
+            dists = np.take_along_axis(dists, order, axis=1)
+        else:
+            assert dataset is not None, "dataset is required for rerank mode if rerank_index is not provided"
+            q, k_candidates = inds.shape
+            dists = np.empty((q, k_candidates), dtype=np.float32)
+            for j in range(q):
+                batch = dataset.collate_fn([dataset[int(i)] for i in inds[j]])
+                model_input = _prepare_model_input_batch(self.device, batch)
+                out = self.model(model_input)
+                rerank_descriptors_array = _extract_descriptors(out, extract_key="rerank_descriptor")
+                row_dists = _l2_sq_distances(
+                    rerank_descriptors[j : j + 1],
+                    rerank_descriptors_array[np.newaxis, :, :],
+                )[0]
+                order = np.argsort(row_dists)
+                inds[j] = inds[j][order]
+                dists[j] = row_dists[order]
+
+        dt = perf_counter() - t0
+        self._rerank_index_search_calls += 1
+        self._rerank_index_search_time_total_s += dt
+        self.rerank_index_search_time_mean_s = self._rerank_index_search_time_total_s / self._rerank_index_search_calls
+        
+        
+        
+        meta_index = self.rerank_index if self.rerank_index is not None else self.index
+        db_idx, db_pose, _db_pc = meta_index.get_meta(inds.reshape(-1))
+        db_idx = db_idx.reshape(inds.shape)
+        db_pose = db_pose.reshape(*inds.shape, -1)
+        results: list[PlaceRecognitionResult] = []
+        for row in range(rerank_descriptors.shape[0]):
+            results.append(
+                PlaceRecognitionResult(
+                    descriptor=descriptors[row],
+                    rerank_descriptor=rerank_descriptors[row],
+                    indices=inds[row].astype(np.int64, copy=False),
+                    distances=dists[row].astype(np.float32, copy=False),
+                    db_idx=db_idx[row].astype(np.int64, copy=False),
+                    db_pose=db_pose[row].astype(np.float32, copy=False),
+                )
+            )
+        return results
+
+    # @torch.inference_mode()
+    # def batch_infer_descriptors(self, batch: Dict[str, Any]) -> np.ndarray:
+    #     """Run batched descriptor extraction."""
+    #     model_input = _prepare_model_input_batch(self.device, batch)
+    #     out1 = self.model1(model_input)
+    #     out2 = self.model2(model_input)
+    #     return _extract_descriptors(out1), _extract_descriptors(out2)
+
+    @torch.inference_mode()
+    def batch_infer(self, batch: Dict[str, Any], k: int = 5, dataset: PRDataset | None = None) -> list[PlaceRecognitionResult]:
+        """Run batched PR inference and return one result per sample."""
+        model_input = _prepare_model_input_batch(self.device, batch)
+        out = self.model(model_input)
+
+        if self.rerank_model is not None:
+            rerank_out = self.rerank_model(model_input)
+            descriptors, rerank_descriptors = _extract_descriptors(out), _extract_descriptors(rerank_out)
+            return self._search_descriptors(descriptors, rerank_descriptors, k=k)
+        else:
+            descriptors, rerank_descriptors = _extract_descriptors(out), _extract_descriptors(out, extract_key="rerank_descriptor")
+            return self._search_descriptors(descriptors, rerank_descriptors, k=k, dataset=dataset)
+
+    @torch.inference_mode()
+    def infer(self, input_data: dict[str, Any], k: int = 5, dataset: PRDataset | None = None) -> PlaceRecognitionResult:
+        """Run a single-sample inference and top-k search.
+
+        Args:
+            input_data: Legacy keys ``image_*`` / ``graph_*`` (unbatched tensors), or collated
+                keys ``images_*`` / ``graphs_*`` with batch dimension 1 (same layout as
+                ``batch_infer``).
+            k: Number of neighbors to retrieve.
+
+        Returns:
+            PlaceRecognitionResult: descriptor, raw distances and mapped metadata.
+
+        Raises:
+            KeyError: If model output does not contain the `final_descriptor` key.
+            ValueError: If the produced descriptor has an unexpected shape.
+        """
+        with torch.no_grad():
+            if _looks_like_collated_pr_batch(input_data):
+                model_input = _prepare_model_input_batch(self.device, input_data)
+            else:
+                model_input = _preprocess_input(self.device, input_data)
+            ext1_start = perf_counter()
+            out = self.model(model_input)
+            ext1_end = perf_counter()
+            
+            ext2_start = perf_counter()
+            if self.rerank_model is not None:
+                rerank_out = self.rerank_model(model_input)
+            ext2_end = perf_counter()
+
+            self._extract_calls += 1
+            self._rerank_extract_calls += 1
+            self._extract_time_total_s += ext1_end - ext1_start
+            self._rerank_extract_time_total_s += ext2_end - ext2_start if self.rerank_model is not None else 0
+            self.extract_time_mean_s = self._extract_time_total_s / self._extract_calls
+            self.rerank_extract_time_mean_s = self._rerank_extract_time_total_s / self._extract_calls
+
+        descriptors = _extract_descriptors(out)
+        rerank_descriptors = _extract_descriptors(rerank_out) if self.rerank_model is not None else _extract_descriptors(out, extract_key="rerank_descriptor")
+        if descriptors.shape[0] != 1 or rerank_descriptors.shape[0] != 1:
+            raise ValueError("Expected a single descriptor for single-sample inference")
+        return self._search_descriptors(descriptors, rerank_descriptors, k=k, dataset=dataset)[0]
 
 
 # =============================================================================

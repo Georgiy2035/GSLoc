@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Any, Callable, List
+from time import perf_counter
 
 import json
 import numpy as np
+import pandas as pd
 from scipy.spatial.transform import Rotation
+import random
 
 from opr.inference.index import FaissFlatIndex
 
@@ -14,24 +17,31 @@ from mmpr.pr_cache import load_pr_cache_npz
 from mmpr.sequence_emulator import EmulatorConfig, emulate_sequence_fusion
 from mmpr.metrics import recall_at_k_per_query, build_micro_curves_from_rankings
 from mmpr.data.transforms import get_T_map_to_world
+from gsloc.datasets.pr_dataset import build_valid_subset
+from mmpr.pr_cache import PerFramePR
 
 
 @dataclass
 class SequenceBenchmarkConfig:
-    db_index_dir: Path
-    cache_path: Path
-    root_data_dir: Path
-    map_name: str
+    q_df: pd.DataFrame
+    db_df: pd.DataFrame
+    frames: list[PerFramePR]
     max_window: int = 20
     per_frame_k_used: int | None = None
     final_k: int = 25
     recency_weighting: Literal["none", "linear", "exp"] = "none"
-    recall_threshold_m: float = 5.0
+    similarity_func: Callable[[dict, dict], bool] = lambda a, b, **kwargs: False
+    similarity_kwargs: dict[str, Any] | None = None
+    std_mode: Literal["scene", "global"] = "scene"
+    scene_df_field: str | None = "scene"
+    pose_df_field: str | None = "pose"
+    seq_filter_kwargs: dict[str, Any] | None = None
 
 
 @dataclass
 class BenchmarkArtifacts:
     recall_at_k: dict[int, float]
+    recall_at_k_std: dict[int, float]
     auc_pr: float
     f1_max: float
     max_recall_at_prec1: float
@@ -44,73 +54,48 @@ class BenchmarkArtifacts:
 class SequencePRBenchmarker:
     def __init__(self, cfg: SequenceBenchmarkConfig) -> None:
         self.cfg = cfg
-        self.index: FaissFlatIndex | None = None
-        self.frames = None
-        self.query_xyz: np.ndarray | None = None
         self.valid_indices: list[int] = []
 
     # --- data loading helpers ---
-    def _load_query_xyz(self) -> np.ndarray:
-        map_dir = (self.cfg.root_data_dir / self.cfg.map_name / "keyframe_map").resolve()
-        traj_path = map_dir / "poses.csv"
-        vals = np.genfromtxt(str(traj_path), delimiter=",", comments="#", dtype=np.float32)
-        if vals.ndim == 1:
-            vals = vals.reshape(1, -1)
-        xyz = vals[:, 1:4].astype(np.float32, copy=False)
-        quat = vals[:, 4:8].astype(np.float32, copy=False)
-        T_m2w = get_T_map_to_world(self.cfg.map_name)
-        out = np.zeros_like(xyz, dtype=np.float32)
-        for i in range(xyz.shape[0]):
-            Rm = Rotation.from_quat(quat[i]).as_matrix().astype(np.float32)
-            T = np.eye(4, dtype=np.float32)
-            T[:3, :3] = Rm
-            T[:3, 3] = xyz[i]
-            Tw = T_m2w @ T
-            out[i] = Tw[:3, 3]
-        return out
-
-    def _build_valid_subset(self, query_xyz: np.ndarray, index: FaissFlatIndex) -> list[int]:
-        """Build valid subset of queries.
-        
-        We consider a query valid if it has at least one database pose within the recall threshold.
-
-        Args:
-            query_xyz: (N, 3) array of query positions
-            index: FaissFlatIndex
-
-        Returns:
-            list[int]: valid query indices
-        """
-        thr = float(self.cfg.recall_threshold_m)
-        valid: list[int] = []
-        db_all_xyz = None
-        try:
-            db_all_xyz = index._db_pose[:, :3]  # type: ignore[attr-defined]
-        except Exception:
-            db_all_xyz = None
-        if isinstance(db_all_xyz, np.ndarray):
-            for i, q in enumerate(query_xyz):
-                d = np.linalg.norm(db_all_xyz - q[None, :], axis=1)
-                if np.any(d < thr):
-                    valid.append(i)
-        else:
-            valid = list(range(query_xyz.shape[0]))
-        return valid
+    # def _load_query_xyz(self) -> np.ndarray:
+    #     map_dir = (self.cfg.root_data_dir / self.cfg.map_name / "keyframe_map").resolve()
+    #     traj_path = map_dir / "poses.csv"
+    #     vals = np.genfromtxt(str(traj_path), delimiter=",", comments="#", dtype=np.float32)
+    #     if vals.ndim == 1:
+    #         vals = vals.reshape(1, -1)
+    #     xyz = vals[:, 1:4].astype(np.float32, copy=False)
+    #     quat = vals[:, 4:8].astype(np.float32, copy=False)
+    #     T_m2w = get_T_map_to_world(self.cfg.map_name)
+    #     out = np.zeros_like(xyz, dtype=np.float32)
+    #     for i in range(xyz.shape[0]):
+    #         Rm = Rotation.from_quat(quat[i]).as_matrix().astype(np.float32)
+    #         T = np.eye(4, dtype=np.float32)
+    #         T[:3, :3] = Rm
+    #         T[:3, 3] = xyz[i]
+    #         Tw = T_m2w @ T
+    #         out[i] = Tw[:3, 3]
+    #     return out
 
     # --- main API ---
     def run(self) -> BenchmarkArtifacts:
         """Benchmark Sequence Place Recognition (micro-averaged metrics)"""
-        # Load cache and index
-        self.frames = load_pr_cache_npz(self.cfg.cache_path)
-        self.index = FaissFlatIndex.load(str(self.cfg.db_index_dir))
-
-        # Build GT query positions and valid subset
-        self.query_xyz = self._load_query_xyz()
-        if len(self.query_xyz) > len(self.frames):
-            self.query_xyz = self.query_xyz[:len(self.frames)]
-        if len(self.query_xyz) != len(self.frames):
-            raise RuntimeError(f"#query_xyz ({len(self.query_xyz)}) != #frames ({len(self.frames)}) in {self.cfg.cache_path}")
-        self.valid_indices = self._build_valid_subset(self.query_xyz, self.index)
+        # Build valid subset
+        # print("Building valid subset...")
+        # self.valid_indices = build_valid_subset(
+        #     self.cfg.q_df, 
+        #     self.cfg.db_df, 
+        #     self.cfg.similarity_func,
+        #     **self.cfg.similarity_kwargs,
+        # )
+        self.valid_indices = list(range(len(self.cfg.q_df)))
+        Ks = list(range(1, 26))
+        if self.cfg.std_mode == "scene":
+            scene_stats = {scene: {k: [] for k in Ks} for scene in self.cfg.q_df[self.cfg.scene_df_field].unique()}
+        else:
+            scene_stats = {scene: {k: [] for k in Ks} for scene in range(len(self.valid_indices) // 100)}
+        
+        scene_data = list(self.cfg.q_df[self.cfg.scene_df_field]) if self.cfg.scene_df_field is not None else None
+        pose_data = list(self.cfg.q_df[self.cfg.pose_df_field]) if self.cfg.pose_df_field is not None else None
 
         # Emulate sequence fusion
         cfg = EmulatorConfig(
@@ -119,74 +104,95 @@ class SequencePRBenchmarker:
             final_k=int(self.cfg.final_k),
             recency_weighting=str(self.cfg.recency_weighting),
         )
-        fused = emulate_sequence_fusion(self.frames, cfg)
-
+        t0 = perf_counter()
+        fused = emulate_sequence_fusion(
+            self.cfg.frames, 
+            cfg, 
+            scene_data=scene_data, 
+            pose_data=pose_data, 
+            seq_similarity_filter_mode=self.cfg.seq_filter_kwargs["seq_similarity_filter_mode"],
+            seq_similarity_trans_tol_m=self.cfg.seq_filter_kwargs["seq_similarity_trans_tol_m"], 
+            seq_similarity_rot_tol_deg=self.cfg.seq_filter_kwargs["seq_similarity_rot_tol_deg"]
+        )
+        dt = perf_counter() - t0
+        self.emulate_sequence_fusion_time_mean_s = dt / len(self.cfg.frames)
         # Build rankings and db_idx->xyz cache
-        db_xyz_by_db_idx: dict[int, np.ndarray] = {}
+        
         rankings: list[tuple[np.ndarray, np.ndarray]] = []
         for fused_d, fused_i in fused:
             if fused_i.size == 0:
                 rankings.append((np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int64)))
                 continue
-            db_idx, db_pose, _db_pc = self.index.get_meta(fused_i)
-            for j in range(db_idx.shape[0]):
-                did = int(db_idx[j])
-                if did not in db_xyz_by_db_idx:
-                    db_xyz_by_db_idx[did] = np.asarray(db_pose[j][:3], dtype=np.float32)
-            rankings.append((fused_d, db_idx))
-
-        thr = float(self.cfg.recall_threshold_m)
+            rankings.append((fused_d, fused_i))
 
         def oracle(query_id: int, db_idx: int) -> bool:
-            if not (0 <= query_id < self.query_xyz.shape[0]):
-                return False
-            q = self.query_xyz[int(query_id)]
-            d = db_xyz_by_db_idx.get(int(db_idx))
-            if d is None:
-                return False
-            return float(np.linalg.norm(q - d)) < thr
+            return self.cfg.similarity_func(
+                self.cfg.q_df.iloc[query_id].to_dict(), 
+                self.cfg.db_df.iloc[db_idx].to_dict(), 
+                **self.cfg.similarity_kwargs)
+
+        def oracle_query(query_id: int, db_idx: [int]) -> bool:
+            q_dict = self.cfg.q_df.iloc[query_id].to_dict()
+            return [self.cfg.similarity_func(
+                q_dict, 
+                self.cfg.db_df.iloc[db].to_dict(), 
+                **self.cfg.similarity_kwargs) for db in db_idx]
 
         # Recall@K (K in [1..25]) on valid subset
-        Ks = list(range(1, 26))
         recalls = {k: [] for k in Ks}
+        is_pos_all = []
         for qid in self.valid_indices:
             dists, db_ids = rankings[qid]
-            is_pos = np.array([oracle(qid, int(db)) for db in db_ids], dtype=bool)
+            is_pos = np.array(oracle_query(qid, db_ids), dtype=bool)
             stats = recall_at_k_per_query(db_ids, is_pos, Ks)
+
+            random_scene = random.randint(0, len(scene_stats) - 1)
             for k in Ks:
                 recalls[k].append(stats[k])
+                if self.cfg.std_mode == "scene":
+                    scene_stats[self.cfg.q_df.iloc[qid][self.cfg.scene_df_field]][k].append(stats[k])
+                else:
+                    scene_stats[random_scene][k].append(stats[k])
+            is_pos_all.append(is_pos)
+        
         recall_at_k = {k: float(np.mean(recalls[k]) if len(recalls[k]) > 0 else 0.0) for k in Ks}
+
+        scene_recall_at_k = {k: {scene: float(np.mean(scene_stats[scene][k]) if len(scene_stats[scene][k]) > 0 else 0.0) for scene in scene_stats.keys()} for k in Ks}
+        recall_at_k_std = {k: np.std(list(scene_recall_at_k[k].values())) for k in Ks}
 
         # Micro PR curves/metrics on valid subset
         filtered_rankings = [rankings[i] for i in self.valid_indices]
         filtered_query_ids = np.asarray(self.valid_indices, dtype=np.int64)
-        curves = build_micro_curves_from_rankings(filtered_rankings, oracle, query_ids=filtered_query_ids)
+        # curves = build_micro_curves_from_rankings(filtered_rankings, oracle, query_ids=filtered_query_ids)
 
-        # Prepare artifacts (curves and padded fused rankings)
+        # # Prepare artifacts (curves and padded fused rankings)
         curves_dict = {
-            "precision": curves.precision,
-            "recall": curves.recall,
-            "thresholds": curves.thresholds,
-            "f1": curves.f1,
+            "precision": 0,#curves.precision,
+            "recall": 0,#curves.recall,
+            "thresholds": 0,#curves.thresholds,
+            "f1": 0,#curves.f1,
         }
         max_len = max((len(r[0]) for r in rankings), default=0)
         fused_np: tuple[np.ndarray, np.ndarray] | None
         if max_len > 0:
             D = np.full((len(rankings), max_len), np.inf, dtype=np.float32)
             I = np.full((len(rankings), max_len), -1, dtype=np.int64)
+            R = np.full((len(rankings), max_len), False, dtype=bool)
             for i, (d, db) in enumerate(rankings):
                 L = min(len(d), max_len)
                 D[i, :L] = d[:L]
                 I[i, :L] = db[:L]
-            fused_np = (D, I)
+                R[i, :L] = is_pos_all[i][:L]
+            fused_np = (D, I, R)
         else:
             fused_np = None
 
         return BenchmarkArtifacts(
             recall_at_k=recall_at_k,
-            auc_pr=curves.auc_pr,
-            f1_max=curves.f1_max,
-            max_recall_at_prec1=curves.max_recall_at_prec1,
+            recall_at_k_std=recall_at_k_std,
+            auc_pr=0,#curves.auc_pr,
+            f1_max=0,#curves.f1_max,
+            max_recall_at_prec1=0,#curves.max_recall_at_prec1,
             num_queries_total=int(len(rankings)),
             num_queries_valid=int(len(self.valid_indices)),
             curves=curves_dict,
@@ -204,11 +210,13 @@ class SequencePRBenchmarker:
                 ),
                 "final_k": int(self.cfg.final_k),
                 "recency_weighting": str(self.cfg.recency_weighting),
-                "recall_threshold_m": float(self.cfg.recall_threshold_m),
+                "similarity_kwargs": self.cfg.similarity_kwargs,
             },
             "recall_at_k": artifacts.recall_at_k,
+            "recall_at_k_std": artifacts.recall_at_k_std,
             "auc_pr": artifacts.auc_pr,
             "f1_max": artifacts.f1_max,
+            "sequence_fusion_time_mean_s": self.emulate_sequence_fusion_time_mean_s,
             "max_recall_at_prec1": artifacts.max_recall_at_prec1,
             "num_queries_total": artifacts.num_queries_total,
             "num_queries_valid": artifacts.num_queries_valid,
@@ -224,5 +232,5 @@ class SequencePRBenchmarker:
         )
 
         if artifacts.fused_rankings is not None:
-            D, I = artifacts.fused_rankings
-            np.savez_compressed(str(out_dir / "fused_rankings.npz"), distances=D, db_idx=I)
+            D, I, R = artifacts.fused_rankings
+            np.savez_compressed(str(out_dir / "fused_rankings.npz"), distances=D, db_idx=I, is_pos=R)
