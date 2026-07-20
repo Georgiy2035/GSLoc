@@ -229,6 +229,10 @@ class PRInferencer:
             self.rerank_index_search_time_mean_s = 0
             self.rerank_extract_calls = 0
 
+        # if self.time_test:
+        #     q_cache_dir.mkdir(parents=True, exist_ok=True)
+        #     self._save_time_data(q_cache_dir / "time.json")
+
         #######FULL QUERY DESCRIPTORS AND PR CACHE CALCULATION########################
         # If query descriptors are being rebuilt, we also rebuild pr_cache from scratch.
         need_full_pr_rebuild = rebuild_query_descriptors or q_cache_dir is None or (not q_cache_dir.exists())
@@ -299,7 +303,7 @@ class PRInferencer:
             )
         using_rerank = rerank_descriptors is not None
 
-        print("Descriptors loaded: ", descriptors.shape, rerank_descriptors.shape, "getting results")
+        print("Descriptors loaded: ", descriptors.shape, rerank_descriptors.shape if rerank_descriptors is not None else "None", "getting results")
         iter_d = zip(descriptors, rerank_descriptors) if using_rerank else descriptors
         for ds in tqdm(iter_d, desc="retrieval"):
             results = self.pr._search_descriptors(np.array([ds[0]]), np.array([ds[1]]), k_final, dataset=database_dataset) \
@@ -332,8 +336,7 @@ class PRInferencer:
         if not self.frames:
             raise ValueError("No frames to save. Run `run()` first or pass `frames` explicitly.")
         save_pr_cache_npz(output, self.frames)
-        if self.time_test:
-            self._save_time_data(output.parent / "time.json")
+        
 
     def _save_time_data(self, time_path: Path) -> None:
         time_schema = {

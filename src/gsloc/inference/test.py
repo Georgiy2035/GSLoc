@@ -41,6 +41,7 @@ class TestConfig:
 
     ########DATASET CONFIG#################
     dataset_class: PRDataset
+    scans_dir: str | None = None
     filter_kwargs: dict = field(default_factory=lambda: {
         "similarity_filter_mode": "none",
         "similarity_trans_tol_m": 2,
@@ -117,6 +118,7 @@ class Test:
             graph_path=cfg.graph_path,
             edge_normalizer_path=cfg.edge_normalizer_path,
             modality=cfg.modality,
+            scans_dir=cfg.scans_dir,
             **cfg.filter_kwargs
         )
 
@@ -134,6 +136,7 @@ class Test:
             graph_path=cfg.graph_path,
             edge_normalizer_path=cfg.edge_normalizer_path,
             modality=cfg.modality,
+            scans_dir=cfg.scans_dir,
         )
 
         self.index = FaissFlatIndex.generate(
